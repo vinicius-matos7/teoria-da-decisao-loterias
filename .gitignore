@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Material didático e bibliografia (ignorado do repositório)
+bibliografia/
+
+# Vídeos e arquivos pesados (> 100 MB excede o limite do GitHub)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar.gz
+
+# Ambientes virtuais e IDEs
+.env
+.venv
+env/
+venv/
+.vscode/
+.idea/
+
+# Sistema Operacional
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
