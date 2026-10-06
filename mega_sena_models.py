@@ -10,6 +10,8 @@ Baseado nos conceitos de Inferência Bayesiana e Teoria da Decisão (Esteves, Iz
 """
 
 import os
+import glob
+import re
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
@@ -67,10 +69,71 @@ def detect_lottery_game(filepath: str, df: Optional[pd.DataFrame] = None) -> str
     return 'megasena'
 
 
-def resolve_filepath(filepath: str) -> str:
+def find_latest_lottery_file(game: str = 'megasena', search_dir: Optional[str] = None) -> str:
+    """
+    Encontra o arquivo .xlsx (ou .csv) mais recente para a loteria indicada.
+    Procura em pastas comuns ('excel', '.', '..', 'planilhas', etc.)
+    e extrai o número do concurso do nome do arquivo (ex: *_ate_concurso_3066_sorteio.xlsx).
+    """
+    game_clean = game.lower().replace('-', '').replace('_', '')
+    if 'mega' in game_clean:
+        prefix = 'mega_sena'
+    elif 'loto' in game_clean:
+        prefix = 'loto_facil'
+    elif 'quina' in game_clean:
+        prefix = 'quina'
+    else:
+        prefix = game_clean
+
+    module_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+    candidate_dirs = [search_dir] if search_dir else [
+        'excel',
+        os.path.join(module_dir, 'excel'),
+        os.path.join('.', 'excel'),
+        os.path.join('..', 'excel'),
+        module_dir,
+        '.',
+        'planilhas',
+        os.path.join(module_dir, 'planilhas'),
+    ]
+
+    found_files = []
+    seen = set()
+    for d in candidate_dirs:
+        if not d or not os.path.exists(d):
+            continue
+        abs_d = os.path.abspath(d)
+        if abs_d in seen:
+            continue
+        seen.add(abs_d)
+        for ext in ('*.xlsx', '*.csv'):
+            for p in glob.glob(os.path.join(d, ext)):
+                fname = os.path.basename(p).lower()
+                if prefix in fname or game_clean in fname:
+                    m = re.search(r'concurso_(\d+)', fname)
+                    num = int(m.group(1)) if m else 0
+                    priority = 1 if p.endswith('.xlsx') else 0
+                    found_files.append((num, priority, p))
+
+    if found_files:
+        found_files.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return found_files[0][2]
+
+    return os.path.join('excel', f"{prefix}.xlsx")
+
+
+def resolve_filepath(filepath: Optional[str] = None, game: str = 'auto') -> str:
     """Procura o arquivo no caminho original ou nas pastas de dados/planilhas/excel."""
-    if os.path.exists(filepath):
+    if filepath and os.path.exists(filepath):
         return filepath
+
+    # Se filepath for o nome de um jogo ou None, tenta buscar o arquivo mais recente
+    if not filepath or filepath in LOTTERY_CONFIGS:
+        game_to_use = filepath if (filepath in LOTTERY_CONFIGS) else (game if game != 'auto' else 'megasena')
+        latest = find_latest_lottery_file(game_to_use)
+        if os.path.exists(latest):
+            return latest
+
     candidates = [
         filepath,
         os.path.join('excel', filepath),
@@ -98,14 +161,26 @@ def resolve_filepath(filepath: str) -> str:
         csv_c = c.replace('.xlsx', '.csv')
         if os.path.exists(csv_c):
             return csv_c
+
+    # Tenta descobrir o arquivo mais recente para o jogo detectado
+    detected = game if game != 'auto' else detect_lottery_game(filepath)
+    latest = find_latest_lottery_file(detected)
+    if os.path.exists(latest):
+        return latest
+
     return filepath
 
 
-def load_lottery_data(filepath: str, game: str = 'auto') -> Tuple[pd.DataFrame, np.ndarray, Dict]:
+def load_lottery_data(filepath: Optional[str] = None, game: str = 'auto') -> Tuple[pd.DataFrame, np.ndarray, Dict]:
     """
     Carrega dados de qualquer loteria (Mega-Sena, Lotofácil, Quina) com suporte a .xlsx e .csv.
     """
-    filepath = resolve_filepath(filepath)
+    if filepath is None or filepath in LOTTERY_CONFIGS:
+        game_name = filepath if (filepath in LOTTERY_CONFIGS) else (game if game != 'auto' else 'megasena')
+        filepath = find_latest_lottery_file(game_name)
+    else:
+        filepath = resolve_filepath(filepath, game=game)
+
     if not os.path.exists(filepath):
         csv_fallback = filepath.replace('.xlsx', '.csv')
         if os.path.exists(csv_fallback):
@@ -847,7 +922,7 @@ def run_all_lottery_methods(filepath: str,
 
 
 if __name__ == '__main__':
-    excel_path = 'mega_sena_asloterias_ate_concurso_3065_sorteio.xlsx'
+    excel_path = find_latest_lottery_file('megasena')
     print(f"Executando estimativas para a Mega-Sena a partir de '{excel_path}'...\n")
     results = run_all_methods(excel_path)
     print("=" * 80)
