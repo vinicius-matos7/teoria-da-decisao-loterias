@@ -1,6 +1,6 @@
 # Teoria da Decisão & Modelagem Preditiva de Loterias
 
-Projeto analítico e probabilístico para modelagem de loterias brasileiras (**Mega-Sena**, **Lotofácil** e **Quina**) utilizando conceitos de **Inferência Bayesiana** e **Teoria da Decisão**, fundamentados na literatura dos professores **Luís Gustavo Esteves, Rafael Izbicki e Rafael Bassi Stern** (*Aprendizado de Máquina sob a Ótica Bayesiana* e *Inferência Bayesiana e Teoria da Decisão*).
+Projeto analítico e probabilístico para modelagem de loterias brasileiras (**Mega-Sena**, **Lotofácil** e **Quina**) utilizando conceitos de **Inferência Bayesiana** e **Teoria da Decisão**, fundamentados na literatura dos professores **Luís Gustavo Esteves, Rafael Izbicki e Rafael Bassi Stern** (*Inferência Bayesiana: Notas de Aula*) e **Rafael Izbicki e Tiago Mendonça dos Santos** (*Aprendizado de máquina: uma abordagem estatística*).
 
 ---
 
@@ -58,5 +58,5 @@ Ou abra qualquer um dos notebooks diretamente no VS Code. Todos os notebooks já
 ---
 
 ## 📚 Referências Bibliográficas
-* ESTEVES, Luís Gustavo; IZBICKI, Rafael; STERN, Rafael Bassi. *Aprendizado de Máquina sob a Ótica Bayesiana*.
-* STERN, Rafael Bassi. *Inferência Bayesiana e Teoria da Decisão*.
+* ESTEVES, Luís Gustavo; IZBICKI, Rafael; STERN, Rafael Bassi. *Inferência Bayesiana: Notas de Aula*. IME-USP / UFSCar.
+* IZBICKI, Rafael; SANTOS, Tiago Mendonça dos. *Aprendizado de máquina: uma abordagem estatística*. 1. ed. 2020.
