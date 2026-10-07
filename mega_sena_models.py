@@ -1,12 +1,14 @@
 """
 mega_sena_models.py
 ===================
-Módulo com 3 métodos analíticos e preditivos para estimar dezenas da Mega-Sena:
+Módulo com 4 métodos analíticos e preditivos para estimar dezenas das Loterias Caixa (Mega-Sena, Lotofácil, Quina):
 1. Método 1: Estatístico (Frequência Ponderada no Tempo + Métrica de Atraso)
 2. Método 2: Machine Learning Multi-label (Janelas Móveis Temporais + Probabilidades Calibradas)
 3. Método 3: Bayesiano & Teoria da Decisão (Conjugada Beta-Binomial + Maximização de Utilidade Esperada)
+4. Método 4: A Geometria do Acaso (Gabaritos Diofantinos de Cores - Renato Gianella, 2013)
 
-Baseado nos conceitos de Inferência Bayesiana e Teoria da Decisão (Esteves, Izbicki e Stern).
+Baseado nos conceitos de Inferência Bayesiana e Teoria da Decisão (Esteves, Izbicki e Stern)
+e na Combinatória de Gianella (2013).
 """
 
 import os
@@ -30,6 +32,8 @@ LOTTERY_CONFIGS = {
         'ball_cols': [f'bola {i}' for i in range(1, 7)],
         'alpha_0': 1.0,
         'beta_0': 9.0,   # E[theta] = 6/60 = 0.10
+        'gianella_groups': 6,
+        'gianella_group_size': 10,
     },
     'lotofacil': {
         'name': 'Lotofácil',
@@ -38,6 +42,8 @@ LOTTERY_CONFIGS = {
         'ball_cols': [f'bola {i}' for i in range(1, 16)],
         'alpha_0': 6.0,
         'beta_0': 4.0,   # E[theta] = 15/25 = 0.60
+        'gianella_groups': 5,
+        'gianella_group_size': 5,
     },
     'quina': {
         'name': 'Quina',
@@ -46,6 +52,8 @@ LOTTERY_CONFIGS = {
         'ball_cols': [f'bola {i}' for i in range(1, 6)],
         'alpha_0': 1.0,
         'beta_0': 15.0,  # E[theta] = 5/80 = 0.0625
+        'gianella_groups': 8,
+        'gianella_group_size': 10,
     }
 }
 
@@ -840,13 +848,173 @@ class BayesianDecisionModel:
         return float(linear_util)
 
 
+
+# ==============================================================================
+# 3.5. MÉTODO 4: A GEOMETRIA DO ACASO (GABARITOS DIOFANTINOS DE CORES)
+# Renato Gianella (2013), "The Geometry of Chance: Lotto Numbers Follow a Predicted Pattern"
+# ==============================================================================
+
+class GianellaColorTemplateModel:
+    """
+    Método 4: A Geometria do Acaso (Gianella Color Template Model)
+    Baseado em Renato Gianella (2013), 'The Geometry of Chance: Lotto Numbers
+    Follow a Predicted Pattern', Revista Brasileira de Biometria, 31(4), 582-597.
+    
+    Conceitos formais e matemáticos:
+    - Partição do universo N de dezenas em C grupos regulares de cores D_0, ..., D_{C-1}.
+    - Equação Diofantina Linear: sum_{i=0}^{C-1} x_i = k, com 0 <= x_i <= group_size.
+    - Gabaritos de Cores (Templates): partições inteiras ordenadas decrescentes (x_{(1)}, ..., x_{(C)}).
+    - Probabilidade Combinatória Teórica: P(T) = Comb(T) / C(N, k), calculada exatamente
+      pelo produto hipergeométrico multivariado e permutações de cores com repetição.
+    - Princípio da Invariância do Micro-Estado vs Dispersão do Macro-Estado:
+      cada bilhete individual possui probabilidade invariante 1 / C(N, k), mas os gabaritos
+      agregam quantidades drasticamente distintas de combinações simples.
+    - Lei dos Grandes Números: as frequências empíricas históricas convergem para as probabilidades
+      teóricas dos gabaritos.
+    - Decisão Ótima: aposta que atende ao gabarito de maior probabilidade combinatória
+      (maior entropia combinatória), preenchendo as cores mais ativas com as melhores dezenas.
+    """
+    def __init__(self, n_dezenas: int = 60, k: int = 6, group_size: int = 10, random_state: int = 42):
+        self.n_dezenas = n_dezenas
+        self.k = k
+        self.group_size = group_size
+        self.n_colors = n_dezenas // group_size
+        self.random_state = random_state
+        self.template_df_: Optional[pd.DataFrame] = None
+        self.color_scores_: Optional[np.ndarray] = None
+        self.dezena_scores_: Optional[np.ndarray] = None
+        self.top_template_: Optional[Tuple[int, ...]] = None
+
+    def _get_partitions(self, n: int, k_parts: int, max_val: int) -> List[Tuple[int, ...]]:
+        def _helper(rem: int, parts_left: int, cur_max: int):
+            if parts_left == 0:
+                if rem == 0:
+                    yield ()
+                return
+            for val in range(min(cur_max, rem, max_val), -1, -1):
+                for p in _helper(rem - val, parts_left - 1, val):
+                    yield (val,) + p
+        return list(_helper(n, k_parts, max_val))
+
+    def fit(self, binary_matrix: np.ndarray) -> 'GianellaColorTemplateModel':
+        import math
+        from collections import Counter
+
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] < 1:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+        if binary_matrix.shape[1] != self.n_dezenas:
+            raise ValueError(f"binary_matrix deve ter {self.n_dezenas} colunas, encontrado {binary_matrix.shape[1]}.")
+
+        n_draws = binary_matrix.shape[0]
+        total_comb = math.comb(self.n_dezenas, self.k)
+        partitions = self._get_partitions(self.k, self.n_colors, self.group_size)
+
+        theo_data = {}
+        for part in partitions:
+            counts = Counter(part)
+            perm_count = math.factorial(self.n_colors)
+            for _, cnt in counts.items():
+                perm_count //= math.factorial(cnt)
+            ways = 1
+            for val in part:
+                ways *= math.comb(self.group_size, val)
+            comb = perm_count * ways
+            prob = comb / total_comb
+            part_str = '-'.join(str(x) for x in part)
+            theo_data[part_str] = {
+                'part_tuple': part,
+                'combinacoes': comb,
+                'prob_teorica': prob,
+                'empirico_count': 0
+            }
+
+        dezena_sums = binary_matrix.sum(axis=0)
+        self.dezena_scores_ = dezena_sums / n_draws
+
+        color_draws_matrix = np.zeros((n_draws, self.n_colors), dtype=int)
+        for i in range(self.n_colors):
+            start_col = i * self.group_size
+            end_col = (i + 1) * self.group_size
+            color_draws_matrix[:, i] = binary_matrix[:, start_col:end_col].sum(axis=1)
+
+        self.color_scores_ = color_draws_matrix.mean(axis=0)
+
+        for d in range(n_draws):
+            counts = sorted(color_draws_matrix[d, :], reverse=True)
+            p_str = '-'.join(str(x) for x in counts)
+            if p_str in theo_data:
+                theo_data[p_str]['empirico_count'] += 1
+
+        records = []
+        for p_str, d in theo_data.items():
+            emp_freq = d['empirico_count'] / n_draws
+            records.append({
+                'template': p_str,
+                'part_tuple': d['part_tuple'],
+                'combinacoes': d['combinacoes'],
+                'prob_teorica': d['prob_teorica'],
+                'freq_teorica_pct': d['prob_teorica'] * 100.0,
+                'ocorrencias': d['empirico_count'],
+                'freq_empirica_pct': emp_freq * 100.0,
+                'dif_pct': (emp_freq - d['prob_teorica']) * 100.0
+            })
+
+        df_res = pd.DataFrame(records).sort_values('prob_teorica', ascending=False).reset_index(drop=True)
+        self.template_df_ = df_res
+        self.top_template_ = df_res.iloc[0]['part_tuple']
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None, template: Optional[Tuple[int, ...]] = None) -> List[int]:
+        if self.template_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = self.k
+        if k <= 0:
+            return []
+        k = min(k, self.n_dezenas)
+        if template is None:
+            template = self.top_template_
+
+        color_order = np.argsort(self.color_scores_)[::-1]
+        selected_dezenas: List[int] = []
+
+        for idx, color_idx in enumerate(color_order):
+            n_to_pick = template[idx] if idx < len(template) else 0
+            if n_to_pick > 0:
+                start_d = color_idx * self.group_size
+                end_d = (color_idx + 1) * self.group_size
+                group_dezenas = np.arange(start_d, end_d)
+                group_scores = self.dezena_scores_[group_dezenas]
+                top_in_group = group_dezenas[np.argsort(group_scores)[::-1][:n_to_pick]]
+                selected_dezenas.extend(int(x) + 1 for x in top_in_group)
+
+        # Se k > len(selected_dezenas), completa com as melhores dezenas restantes
+        if len(selected_dezenas) < k:
+            selected_set = set(selected_dezenas)
+            sorted_all = np.argsort(self.dezena_scores_)[::-1]
+            for d_idx in sorted_all:
+                d_num = int(d_idx) + 1
+                if d_num not in selected_set:
+                    selected_dezenas.append(d_num)
+                    selected_set.add(d_num)
+                    if len(selected_dezenas) >= k:
+                        break
+
+        return sorted(selected_dezenas[:k])
+
+    def get_template_stats_df(self) -> pd.DataFrame:
+        if self.template_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.template_df_.copy()
+
+
 # ==============================================================================
 # 4. FUNÇÃO COMPARATIVA E RELATÓRIO EXECUTIVO
 # ==============================================================================
 
 def run_all_methods(filepath: str, next_concurso: Optional[int] = None) -> Dict[str, object]:
     """
-    Executa os 3 métodos sobre a base histórica e consolida os resultados
+    Executa os 4 métodos sobre a base histórica e consolida os resultados
     para o próximo concurso especificado (ou inferido automaticamente).
     """
     return run_all_lottery_methods(filepath, game='megasena', next_concurso=next_concurso)
@@ -856,7 +1024,7 @@ def run_all_lottery_methods(filepath: str,
                             game: str = 'auto',
                             next_concurso: Optional[int] = None) -> Dict:
     """
-    Executa os 3 métodos de estimativa para qualquer loteria (Mega-Sena, Lotofácil, Quina).
+    Executa os 4 métodos analíticos para qualquer loteria (Mega-Sena, Lotofácil, Quina).
     """
     df, binary_matrix, cfg = load_lottery_data(filepath, game=game)
     if next_concurso is None:
@@ -889,13 +1057,20 @@ def run_all_lottery_methods(filepath: str,
     m3_dyn.fit(binary_matrix)
     pred_m3_dyn = m3_dyn.predict_top_k(k)
 
+    # 4. Método 4: A Geometria do Acaso (Gianella)
+    group_size = cfg.get('gianella_group_size', 10)
+    m4 = GianellaColorTemplateModel(n_dezenas=cfg['n_dezenas'], k=k, group_size=group_size)
+    m4.fit(binary_matrix)
+    pred_m4 = m4.predict_top_k(k)
+
     predictions = {
         'Metodo 1 (Estatistico - Balanceado)': pred_m1,
         'Metodo 1 (Sub-estrategia Mais Atrasadas)': pred_m1_overdue,
         'Metodo 1 (Sub-estrategia Mais Frequentes Recentes)': pred_m1_momentum,
         'Metodo 2 (Machine Learning Multi-label Calibrado)': pred_m2,
         'Metodo 3 (Bayesiano Conjugado Global)': pred_m3_static,
-        'Metodo 3 (Bayesiano Dinamico Adaptativo)': pred_m3_dyn
+        'Metodo 3 (Bayesiano Dinamico Adaptativo)': pred_m3_dyn,
+        'Metodo 4 (Gianella - Geometria do Acaso)': pred_m4
     }
 
     comparison_records = []
@@ -916,6 +1091,7 @@ def run_all_lottery_methods(filepath: str,
         'm2_model': m2,
         'm3_static': m3_static,
         'm3_dyn': m3_dyn,
+        'm4_gianella': m4,
         'predictions': predictions,
         'comparison_df': comparison_df
     }
