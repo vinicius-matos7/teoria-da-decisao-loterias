@@ -27,6 +27,7 @@ from scipy.stats import beta
 LOTTERY_CONFIGS = {
     'megasena': {
         'name': 'Mega-Sena',
+        'prefix': 'mega_sena',
         'n_dezenas': 60,
         'k': 6,
         'ball_cols': [f'bola {i}' for i in range(1, 7)],
@@ -37,6 +38,7 @@ LOTTERY_CONFIGS = {
     },
     'lotofacil': {
         'name': 'Lotofácil',
+        'prefix': 'lotofacil',
         'n_dezenas': 25,
         'k': 15,
         'ball_cols': [f'bola {i}' for i in range(1, 16)],
@@ -47,6 +49,7 @@ LOTTERY_CONFIGS = {
     },
     'quina': {
         'name': 'Quina',
+        'prefix': 'quina',
         'n_dezenas': 80,
         'k': 5,
         'ball_cols': [f'bola {i}' for i in range(1, 6)],
