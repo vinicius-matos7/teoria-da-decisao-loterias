@@ -94,9 +94,9 @@ Cada notebook executa e compara **4 abordagens metodológicas**:
 ```text
 decision/
 ├── excel/                # Bases de dados oficiais atualizadas (.xlsx e .csv)
-│   ├── mega_sena_asloterias_ate_concurso_3068_sorteio.xlsx
-│   ├── loto_facil_asloterias_ate_concurso_3800_sorteio.xlsx
-│   └── quina_asloterias_ate_concurso_7138_sorteio.xlsx
+│   ├── mega_sena_asloterias_ate_concurso_3069_sorteio.xlsx
+│   ├── loto_facil_asloterias_ate_concurso_3802_sorteio.xlsx
+│   └── quina_asloterias_ate_concurso_7140_sorteio.xlsx
 │
 ├── graficos/             # Gráficos e painéis decisórios exportados em alta resolução
 │   ├── lotofacil_dashboard_decisao.png
