@@ -49,6 +49,13 @@ Desempenho dos modelos individuais versus a **Decisão Ótima de Bayes** e a cur
 
 ---
 
+### 📋 Histórico Consolidado de Acertos dos Modelos
+O repositório mantém um registro contínuo e auditável do desempenho retroativo de cada abordagem preditiva frente aos resultados oficiais sorteados pela Caixa Econômica Federal (*Walk-Forward Validation* estrito sem viés de antecipação):
+* **Planilhas Consolidadas:** [`excel/historico_acertos_modelos.xlsx`](excel/historico_acertos_modelos.xlsx) e [`excel/historico_acertos_modelos.csv`](excel/historico_acertos_modelos.csv).
+* **Métricas Registradas por Concurso:** Dezenas previstas por cada modelo, dezenas reais sorteadas, contagem exata de acertos, taxa de aproveitamento (%) e faixa de premiação oficial obtida.
+
+---
+
 ## 🧠 Metodologia e Fundamentação em Teoria da Decisão
 
 ### A Decisão Ótima de Bayes (Consenso Multicritério)
@@ -95,8 +102,9 @@ Cada notebook executa e compara **4 abordagens metodológicas**:
 decision/
 ├── excel/                # Bases de dados oficiais atualizadas (.xlsx e .csv)
 │   ├── mega_sena_asloterias_ate_concurso_3069_sorteio.xlsx
-│   ├── loto_facil_asloterias_ate_concurso_3802_sorteio.xlsx
-│   └── quina_asloterias_ate_concurso_7140_sorteio.xlsx
+│   ├── loto_facil_asloterias_ate_concurso_3803_sorteio.xlsx
+│   ├── quina_asloterias_ate_concurso_7141_sorteio.xlsx
+│   └── historico_acertos_modelos.xlsx # Registro consolidado de acertos dos modelos
 │
 ├── graficos/             # Gráficos e painéis decisórios exportados em alta resolução
 │   ├── lotofacil_dashboard_decisao.png

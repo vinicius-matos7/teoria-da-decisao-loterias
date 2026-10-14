@@ -204,6 +204,10 @@ def load_lottery_data(filepath: Optional[str] = None, game: str = 'auto') -> Tup
     else:
         try:
             df = pd.read_excel(filepath, skiprows=6)
+            if 'Concurso' not in df.columns:
+                df_direct = pd.read_excel(filepath)
+                if 'Concurso' in df_direct.columns:
+                    df = df_direct
         except (ImportError, ModuleNotFoundError):
             csv_fallback = filepath.replace('.xlsx', '.csv')
             if os.path.exists(csv_fallback):
