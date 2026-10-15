@@ -12,9 +12,24 @@ e na Combinatória de Gianella (2013).
 """
 
 import os
+import sys
 import glob
 import re
 from typing import Dict, List, Optional, Tuple, Union
+
+# No Windows com Anaconda/Miniconda, garante que Library/bin esteja no PATH e registrado para carregar MKL/BLAS DLLs
+if sys.platform == 'win32':
+    for prefix_cand in [sys.prefix, os.path.dirname(sys.executable)]:
+        lib_bin = os.path.join(prefix_cand, 'Library', 'bin')
+        if os.path.exists(lib_bin):
+            if lib_bin not in os.environ.get('PATH', ''):
+                os.environ['PATH'] = lib_bin + os.pathsep + os.environ.get('PATH', '')
+            if hasattr(os, 'add_dll_directory'):
+                try:
+                    os.add_dll_directory(lib_bin)
+                except Exception:
+                    pass
+
 import numpy as np
 import pandas as pd
 from scipy.stats import beta
