@@ -1,12 +1,4 @@
 ﻿Modalidade,Concurso,Data,Modelo,Dezenas_Previstas,Dezenas_Sorteadas,Acertos,Total_Bolas,Aproveitamento_Pct,Faixa_Premiacao,Premiado
-Mega-Sena,3054,06/09/2026,M1: Estatístico Balanceado,"09, 19, 27, 32, 41, 58","08, 17, 24, 43, 47, 58",1,6,16.7,Nenhum,Não
-Mega-Sena,3054,06/09/2026,M1: Mais Atrasadas (Gap),"09, 19, 32, 34, 41, 45","08, 17, 24, 43, 47, 58",0,6,0.0,Nenhum,Não
-Mega-Sena,3054,06/09/2026,M1: Mais Frequentes Recentes,"06, 11, 27, 30, 42, 58","08, 17, 24, 43, 47, 58",1,6,16.7,Nenhum,Não
-Mega-Sena,3054,06/09/2026,M2: ML Multi-label Calibrado,"10, 15, 25, 51, 53, 60","08, 17, 24, 43, 47, 58",0,6,0.0,Nenhum,Não
-Mega-Sena,3054,06/09/2026,M3: Bayesiano Conjugado Global,"05, 10, 27, 33, 37, 53","08, 17, 24, 43, 47, 58",0,6,0.0,Nenhum,Não
-Mega-Sena,3054,06/09/2026,M3: Bayesiano Adaptativo,"06, 11, 14, 27, 30, 58","08, 17, 24, 43, 47, 58",1,6,16.7,Nenhum,Não
-Mega-Sena,3054,06/09/2026,M4: Gianella (Geometria Acaso),"05, 10, 33, 37, 42, 53","08, 17, 24, 43, 47, 58",0,6,0.0,Nenhum,Não
-Mega-Sena,3054,06/09/2026,Decisão Ótima de Bayes (Consenso),"05, 10, 27, 33, 37, 53","08, 17, 24, 43, 47, 58",0,6,0.0,Nenhum,Não
 Mega-Sena,3055,08/09/2026,M1: Estatístico Balanceado,"09, 19, 27, 32, 41, 45","01, 11, 36, 43, 48, 49",0,6,0.0,Nenhum,Não
 Mega-Sena,3055,08/09/2026,M1: Mais Atrasadas (Gap),"09, 19, 32, 34, 41, 45","01, 11, 36, 43, 48, 49",0,6,0.0,Nenhum,Não
 Mega-Sena,3055,08/09/2026,M1: Mais Frequentes Recentes,"06, 11, 17, 27, 30, 58","01, 11, 36, 43, 48, 49",1,6,16.7,Nenhum,Não
@@ -159,6 +151,14 @@ Mega-Sena,3073,22/10/2026,M3: Bayesiano Conjugado Global,"05, 10, 27, 33, 37, 53
 Mega-Sena,3073,22/10/2026,M3: Bayesiano Adaptativo,"06, 10, 11, 17, 27, 43","04, 13, 23, 28, 41, 58",0,6,0.0,Nenhum,Não
 Mega-Sena,3073,22/10/2026,M4: Gianella (Geometria Acaso),"05, 10, 33, 37, 43, 53","04, 13, 23, 28, 41, 58",0,6,0.0,Nenhum,Não
 Mega-Sena,3073,22/10/2026,Decisão Ótima de Bayes (Consenso),"05, 06, 10, 27, 37, 53","04, 13, 23, 28, 41, 58",0,6,0.0,Nenhum,Não
+Mega-Sena,3074,24/10/2026,M1: Estatístico Balanceado,"11, 14, 32, 34, 42, 46","02, 03, 20, 25, 39, 57",0,6,0.0,Nenhum,Não
+Mega-Sena,3074,24/10/2026,M1: Mais Atrasadas (Gap),"03, 32, 34, 42, 46, 59","02, 03, 20, 25, 39, 57",1,6,16.7,Nenhum,Não
+Mega-Sena,3074,24/10/2026,M1: Mais Frequentes Recentes,"06, 11, 17, 27, 43, 58","02, 03, 20, 25, 39, 57",0,6,0.0,Nenhum,Não
+Mega-Sena,3074,24/10/2026,M2: ML Multi-label Calibrado,"10, 12, 16, 35, 41, 44","02, 03, 20, 25, 39, 57",0,6,0.0,Nenhum,Não
+Mega-Sena,3074,24/10/2026,M3: Bayesiano Conjugado Global,"05, 10, 27, 33, 37, 53","02, 03, 20, 25, 39, 57",0,6,0.0,Nenhum,Não
+Mega-Sena,3074,24/10/2026,M3: Bayesiano Adaptativo,"06, 10, 11, 17, 27, 43","02, 03, 20, 25, 39, 57",0,6,0.0,Nenhum,Não
+Mega-Sena,3074,24/10/2026,M4: Gianella (Geometria Acaso),"05, 10, 33, 37, 43, 53","02, 03, 20, 25, 39, 57",0,6,0.0,Nenhum,Não
+Mega-Sena,3074,24/10/2026,Decisão Ótima de Bayes (Consenso),"05, 10, 27, 33, 37, 43","02, 03, 20, 25, 39, 57",0,6,0.0,Nenhum,Não
 Lotofácil,3792,29/09/2026,M1: Estatístico Balanceado,"01, 03, 04, 05, 09, 10, 11, 15, 17, 18, 21, 22, 23, 24, 25","02, 04, 06, 07, 08, 10, 11, 12, 14, 15, 16, 20, 23, 24, 25",7,15,46.7,Nenhum,Não
 Lotofácil,3792,29/09/2026,M1: Mais Atrasadas (Gap),"03, 04, 05, 07, 09, 10, 11, 15, 17, 18, 20, 21, 22, 23, 24","02, 04, 06, 07, 08, 10, 11, 12, 14, 15, 16, 20, 23, 24, 25",8,15,53.3,Nenhum,Não
 Lotofácil,3792,29/09/2026,M1: Mais Frequentes Recentes,"01, 03, 04, 05, 06, 09, 11, 12, 13, 14, 15, 21, 23, 24, 25","02, 04, 06, 07, 08, 10, 11, 12, 14, 15, 16, 20, 23, 24, 25",9,15,60.0,Nenhum,Não
