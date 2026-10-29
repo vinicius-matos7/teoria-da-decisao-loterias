@@ -291,17 +291,16 @@ class TestRunAllLotteryMethods:
 
 
 class TestGeneratedGraphics:
-    @pytest.mark.parametrize("game,concurso", [
-        ("mega_sena", 3067),
-        ("lotofacil", 3797),
-        ("quina", 7135)
+    @pytest.mark.parametrize("game", [
+        "mega_sena",
+        "lotofacil",
+        "quina"
     ])
-    def test_graphics_exist(self, game, concurso):
+    def test_graphics_exist(self, game):
         graficos_dir = os.path.join(BASE_DIR, 'graficos')
-        f1 = os.path.join(graficos_dir, f"{game}_{concurso}_probabilidades_posteriori.png")
-        f2 = os.path.join(graficos_dir, f"{game}_{concurso}_consenso_modelos.png")
-        f3 = os.path.join(graficos_dir, f"{game}_{concurso}_dashboard_decisao.png")
-        
-        for f in [f1, f2, f3]:
+        f1 = os.path.join(graficos_dir, f"{game}_dashboard_decisao.png")
+        f2 = os.path.join(graficos_dir, f"{game}_avaliacao_acertos_erros.png")
+
+        for f in [f1, f2]:
             assert os.path.exists(f), f"Arquivo ausente: {f}"
             assert os.path.getsize(f) > 50000, f"Arquivo corrompido ou vazio: {f}"
