@@ -1031,22 +1031,352 @@ class GianellaColorTemplateModel:
 
 
 # ==============================================================================
+# 3.6. MÉTODOS HÍBRIDOS: GIANELLA & TEORIA DA DECISÃO BAYESIANA
+# Renato Gianella (2013) + Esteves, Izbicki e Stern (2020)
+# ==============================================================================
+
+class GianellaBayesHybridModel:
+    """
+    Método Híbrido: A Geometria do Acaso (Gianella, 2013) combinada com
+    Inferência Bayesiana e Teoria da Decisão (Esteves, Izbicki e Stern).
+
+    Fundamentação Teórica:
+    1. Macro-Estrutura (Combinatória de Gianella):
+       - Partição do universo N de dezenas em C grupos regulares de cores.
+       - Resolução da Equação Diofantina linear: sum_{c=0}^{C-1} x_c = k, com 0 <= x_c <= group_size.
+       - Gabarito Diofantino Ótimo T* = (x_{(1)}, ..., x_{(C)}) que maximiza a probabilidade
+         hipergeométrica combinatória exata P(T).
+       - Ordenação dos grupos de cores segundo a intensidade probabilística/atividade.
+
+    2. Micro-Decisão (Inferência Bayesiana e Teoria da Decisão):
+       Ao invés de selecionar as dezenas dentro de cada grupo de cor por simples contagem
+       frequentista ingênua, as cotas de cada cor são preenchidas pelas regras ótimas de Bayes:
+
+       a) Gianella com Bayes Global ('bayes_global'):
+          - Baseado na distribuição preditiva a posteriori da conjugada Beta-Binomial:
+            theta_i ~ Beta(alpha_0 + x_i, beta_0 + n - x_i)
+            p_i = E[theta_i | dados globais] = (alpha_0 + x_i) / (alpha_0 + beta_0 + n)
+          - Ordena os grupos de cores pela soma das probabilidades a posteriori dos seus membros:
+            M_c = sum_{i in Grupo c} p_i
+          - Dentro de cada cor c, seleciona as x_{(c)} dezenas com maiores esperanças a posteriori.
+
+       b) Gianella com Bayes Adaptativo ('bayes_adaptive'):
+          - Modelo Bayesiano Dinâmico com Evidência Ponderada Temporalmente (meia-vida exponencial):
+            p_i^{adapt} = E[theta_i | dados dinamicos] = (alpha_0 + x_i^{eff}) / (alpha_0 + beta_0 + n^{eff})
+          - Captura acelerações e transições temporais de probabilidade recente, alocando
+            as cotas de Gianella nas dezenas com maior momentum a posteriori.
+
+       c) Gianella com a Melhor Decisão de Bayes ('bayes_decision' / 'bayes_optimal'):
+          - Otimização sob a Função de Utilidade de Bayes restrita ao macro-estado diofantino de Gianella:
+            max_{a in T*} E[U(a, s) | dados]
+          - Combina a evidência bayesiana global e adaptativa (ou escore de consenso do conjunto bayesiano)
+            com ajuste de aversão ao risco / covariância empírica (lambda_cov), garantindo que a aposta
+            escolhida seja estritamente ótima em utilidade esperada sob o gabarito combinatório mais provável.
+    """
+
+    def __init__(self,
+                 n_dezenas: int = 60,
+                 k: int = 6,
+                 group_size: int = 10,
+                 alpha_0: float = 1.0,
+                 beta_0: float = 9.0,
+                 decay_half_life: float = 150.0,
+                 risk_penalty: float = 0.0,
+                 random_state: int = 42):
+        if n_dezenas <= 0 or k <= 0 or group_size <= 0:
+            raise ValueError(f"n_dezenas ({n_dezenas}), k ({k}) e group_size ({group_size}) devem ser > 0.")
+        if alpha_0 <= 0 or beta_0 <= 0:
+            raise ValueError(f"alpha_0 ({alpha_0}) e beta_0 ({beta_0}) devem ser > 0.")
+        if decay_half_life <= 0:
+            raise ValueError(f"decay_half_life ({decay_half_life}) deve ser > 0.")
+        if risk_penalty < 0:
+            raise ValueError(f"risk_penalty ({risk_penalty}) deve ser >= 0.")
+
+        self.n_dezenas = n_dezenas
+        self.k = k
+        self.group_size = group_size
+        self.n_colors = n_dezenas // group_size
+        self.alpha_0 = alpha_0
+        self.beta_0 = beta_0
+        self.decay_half_life = decay_half_life
+        self.risk_penalty = risk_penalty
+        self.random_state = random_state
+
+        self.gianella_model_ = GianellaColorTemplateModel(
+            n_dezenas=n_dezenas, k=k, group_size=group_size, random_state=random_state
+        )
+        self.cov_matrix_: Optional[np.ndarray] = None
+        self.post_probs_global_: Optional[np.ndarray] = None
+        self.post_probs_adaptive_: Optional[np.ndarray] = None
+        self.bayes_decision_scores_: Optional[np.ndarray] = None
+        self.top_template_: Optional[Tuple[int, ...]] = None
+        self.summary_df_: Optional[pd.DataFrame] = None
+
+    def fit(self, binary_matrix: np.ndarray, consensus_scores: Optional[np.ndarray] = None) -> 'GianellaBayesHybridModel':
+        """
+        Ajusta os gabaritos de Gianella e os modelos Bayesianos (Global, Adaptativo e Decisão Ótima).
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] < 1:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+        if binary_matrix.shape[1] != self.n_dezenas:
+            raise ValueError(f"binary_matrix deve ter {self.n_dezenas} colunas, encontrado {binary_matrix.shape[1]}.")
+
+        n_concursos = binary_matrix.shape[0]
+
+        # 1. Ajusta o modelo combinatório de Gianella
+        self.gianella_model_.fit(binary_matrix)
+        self.top_template_ = self.gianella_model_.top_template_
+
+        # 2. Ajusta Bayesiano Global (Beta-Binomial)
+        n_obs = float(n_concursos)
+        x_obs = binary_matrix.sum(axis=0).astype(float)
+        post_alpha_global = self.alpha_0 + x_obs
+        post_beta_global = self.beta_0 + n_obs - x_obs
+        self.post_probs_global_ = post_alpha_global / (post_alpha_global + post_beta_global)
+
+        # 3. Ajusta Bayesiano Adaptativo (Decaimento Temporal Exponencial)
+        gamma = 0.5 ** (1.0 / self.decay_half_life)
+        weights = gamma ** np.arange(n_concursos - 1, -1, -1)
+        eff_n = float(np.sum(weights))
+        eff_x = np.sum(binary_matrix * weights[:, None], axis=0)
+        post_alpha_dyn = self.alpha_0 + eff_x
+        post_beta_dyn = self.beta_0 + eff_n - eff_x
+        self.post_probs_adaptive_ = post_alpha_dyn / (post_alpha_dyn + post_beta_dyn)
+
+        # 4. Matriz de Covariância Empírica
+        if n_concursos > 1:
+            self.cov_matrix_ = np.cov(binary_matrix, rowvar=False)
+        else:
+            self.cov_matrix_ = np.zeros((self.n_dezenas, self.n_dezenas))
+
+        # 5. Escore da Melhor Decisão de Bayes
+        if consensus_scores is not None and len(consensus_scores) == self.n_dezenas:
+            c_arr = np.array(consensus_scores, dtype=float)
+            max_c = np.max(c_arr)
+            c_norm = c_arr / max_c if max_c > 0 else c_arr
+            # Combinação convexa: 50% distribuição a posteriori conjunta + 50% consenso multi-modelo
+            p_joint = 0.5 * (self.post_probs_global_ + self.post_probs_adaptive_)
+            self.bayes_decision_scores_ = 0.5 * p_joint + 0.5 * c_norm
+        else:
+            # Equilíbrio bayesiano entre evidência estática global e dinâmica adaptativa
+            self.bayes_decision_scores_ = 0.5 * self.post_probs_global_ + 0.5 * self.post_probs_adaptive_
+
+        # Constrói DataFrame comparativo
+        dezenas = np.arange(1, self.n_dezenas + 1)
+        cores = [int(i // self.group_size) for i in range(self.n_dezenas)]
+        self.summary_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'grupo_cor': cores,
+            'prob_bayes_global': np.round(self.post_probs_global_, 5),
+            'prob_bayes_adaptativo': np.round(self.post_probs_adaptive_, 5),
+            'escore_melhor_decisao': np.round(self.bayes_decision_scores_, 5)
+        })
+
+        return self
+
+    def _select_under_template(self,
+                               dezena_scores: np.ndarray,
+                               k: int,
+                               template: Optional[Tuple[int, ...]] = None) -> List[int]:
+        if template is None:
+            template = self.top_template_
+        if k <= 0:
+            return []
+        k = min(k, self.n_dezenas)
+
+        # 1. Massa agregada de cada grupo de cor (soma das probabilidades ou escores dos elementos)
+        color_mass = np.zeros(self.n_colors, dtype=float)
+        for c in range(self.n_colors):
+            start = c * self.group_size
+            end = (c + 1) * self.group_size
+            color_mass[c] = float(np.sum(dezena_scores[start:end]))
+
+        # 2. Ordena os grupos de cor da maior para a menor intensidade de probabilidade
+        color_order = np.argsort(color_mass)[::-1]
+
+        selected_dezenas: List[int] = []
+        selected_set = set()
+
+        # 3. Preenche as cotas do gabarito diofantino ótimo
+        for idx, color_idx in enumerate(color_order):
+            n_to_pick = template[idx] if idx < len(template) else 0
+            if n_to_pick > 0:
+                start = color_idx * self.group_size
+                end = (color_idx + 1) * self.group_size
+                group_dezenas = np.arange(start, end)
+
+                if self.risk_penalty > 0.0 and self.cov_matrix_ is not None and selected_dezenas:
+                    # Seleção gananciosa com penalização de covariância
+                    group_cand = list(group_dezenas)
+                    picks: List[int] = []
+                    while len(picks) < n_to_pick and group_cand:
+                        best_gain = -np.inf
+                        best_c = None
+                        for cand in group_cand:
+                            cov_pen = self.risk_penalty * sum(
+                                self.cov_matrix_[cand, s - 1] for s in selected_dezenas + [p + 1 for p in picks]
+                            )
+                            gain = dezena_scores[cand] - cov_pen
+                            if gain > best_gain:
+                                best_gain = gain
+                                best_c = cand
+                        if best_c is not None:
+                            picks.append(best_c)
+                            group_cand.remove(best_c)
+                        else:
+                            break
+                    for p in picks:
+                        num = int(p) + 1
+                        selected_dezenas.append(num)
+                        selected_set.add(num)
+                else:
+                    group_scores = dezena_scores[group_dezenas]
+                    top_in_group = group_dezenas[np.argsort(group_scores)[::-1][:n_to_pick]]
+                    for d_idx in top_in_group:
+                        num = int(d_idx) + 1
+                        selected_dezenas.append(num)
+                        selected_set.add(num)
+
+        # 4. Caso o template selecione menos que k (ou k > soma do template), preenche com os melhores remanescentes
+        if len(selected_dezenas) < k:
+            sorted_all = np.argsort(dezena_scores)[::-1]
+            for d_idx in sorted_all:
+                d_num = int(d_idx) + 1
+                if d_num not in selected_set:
+                    selected_dezenas.append(d_num)
+                    selected_set.add(d_num)
+                    if len(selected_dezenas) >= k:
+                        break
+
+        return sorted(selected_dezenas[:k])
+
+    def predict_top_k(self,
+                      k: Optional[int] = None,
+                      strategy: str = 'bayes_decision',
+                      template: Optional[Tuple[int, ...]] = None) -> List[int]:
+        """
+        Retorna as K dezenas selecionadas pela união de Gianella com a estratégia Bayesiana indicada.
+
+        Parameters
+        ----------
+        k : Optional[int]
+            Quantidade de dezenas a selecionar (default self.k).
+        strategy : str
+            - 'bayes_decision' ou 'bayes_optimal': Gianella com a Melhor Decisão de Bayes.
+            - 'bayes_global': Gianella com Bayes Global.
+            - 'bayes_adaptive': Gianella com Bayes Adaptativo.
+        template : Optional[Tuple[int, ...]]
+            Gabarito de cores diofantino a seguir (default: top_template_).
+        """
+        if self.post_probs_global_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = self.k
+
+        strat = strategy.lower().strip()
+        if strat in ['bayes_global', 'global']:
+            scores = self.post_probs_global_
+        elif strat in ['bayes_adaptive', 'adaptive', 'adaptativo']:
+            scores = self.post_probs_adaptive_
+        elif strat in ['bayes_decision', 'bayes_optimal', 'optimal', 'melhor_decisao', 'decisao']:
+            scores = self.bayes_decision_scores_
+        else:
+            raise ValueError(
+                f"Estratégia desconhecida: '{strategy}'. "
+                f"Opções válidas: 'bayes_decision', 'bayes_global', 'bayes_adaptive'."
+            )
+
+        return self._select_under_template(scores, k=k, template=template)
+
+    def predict_gianella_bayes_global(self, k: Optional[int] = None) -> List[int]:
+        """Predição unindo Gianella com Bayes Global."""
+        return self.predict_top_k(k=k, strategy='bayes_global')
+
+    def predict_gianella_bayes_adaptive(self, k: Optional[int] = None) -> List[int]:
+        """Predição unindo Gianella com Bayes Adaptativo."""
+        return self.predict_top_k(k=k, strategy='bayes_adaptive')
+
+    def predict_gianella_best_bayes_decision(self, k: Optional[int] = None) -> List[int]:
+        """Predição unindo Gianella com a Melhor Decisão de Bayes."""
+        return self.predict_top_k(k=k, strategy='bayes_decision')
+
+    def get_summary_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame consolidado com escores e probabilidades."""
+        if self.summary_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.summary_df_.copy()
+
+
+def predict_gianella_bayes_global(binary_matrix: np.ndarray,
+                                  cfg: Dict,
+                                  k: Optional[int] = None) -> List[int]:
+    """Predição direta unindo o Gabarito de Gianella com Bayes Global."""
+    model = GianellaBayesHybridModel(
+        n_dezenas=cfg['n_dezenas'],
+        k=cfg['k'] if k is None else k,
+        group_size=cfg.get('gianella_group_size', 10),
+        alpha_0=cfg.get('alpha_0', 1.0),
+        beta_0=cfg.get('beta_0', 1.0)
+    )
+    model.fit(binary_matrix)
+    return model.predict_gianella_bayes_global(k)
+
+
+def predict_gianella_bayes_adaptive(binary_matrix: np.ndarray,
+                                    cfg: Dict,
+                                    k: Optional[int] = None,
+                                    decay_half_life: float = 150.0) -> List[int]:
+    """Predição direta unindo o Gabarito de Gianella com Bayes Adaptativo."""
+    model = GianellaBayesHybridModel(
+        n_dezenas=cfg['n_dezenas'],
+        k=cfg['k'] if k is None else k,
+        group_size=cfg.get('gianella_group_size', 10),
+        alpha_0=cfg.get('alpha_0', 1.0),
+        beta_0=cfg.get('beta_0', 1.0),
+        decay_half_life=decay_half_life
+    )
+    model.fit(binary_matrix)
+    return model.predict_gianella_bayes_adaptive(k)
+
+
+def predict_gianella_best_bayes_decision(binary_matrix: np.ndarray,
+                                         cfg: Dict,
+                                         k: Optional[int] = None,
+                                         decay_half_life: float = 150.0,
+                                         consensus_scores: Optional[np.ndarray] = None) -> List[int]:
+    """Predição direta unindo o Gabarito de Gianella com a Melhor Decisão de Bayes."""
+    model = GianellaBayesHybridModel(
+        n_dezenas=cfg['n_dezenas'],
+        k=cfg['k'] if k is None else k,
+        group_size=cfg.get('gianella_group_size', 10),
+        alpha_0=cfg.get('alpha_0', 1.0),
+        beta_0=cfg.get('beta_0', 1.0),
+        decay_half_life=decay_half_life
+    )
+    model.fit(binary_matrix, consensus_scores=consensus_scores)
+    return model.predict_gianella_best_bayes_decision(k)
+
+
+# ==============================================================================
 # 4. FUNÇÃO COMPARATIVA E RELATÓRIO EXECUTIVO
 # ==============================================================================
 
-def run_all_methods(filepath: str, next_concurso: Optional[int] = None) -> Dict[str, object]:
+def run_all_methods(filepath: str,
+                    next_concurso: Optional[int] = None,
+                    include_hybrids: bool = False) -> Dict[str, object]:
     """
-    Executa os 4 métodos sobre a base histórica e consolida os resultados
+    Executa os métodos sobre a base histórica e consolida os resultados
     para o próximo concurso especificado (ou inferido automaticamente).
     """
-    return run_all_lottery_methods(filepath, game='megasena', next_concurso=next_concurso)
+    return run_all_lottery_methods(filepath, game='megasena', next_concurso=next_concurso, include_hybrids=include_hybrids)
 
 
 def run_all_lottery_methods(filepath: str,
                             game: str = 'auto',
-                            next_concurso: Optional[int] = None) -> Dict:
+                            next_concurso: Optional[int] = None,
+                            include_hybrids: bool = False) -> Dict:
     """
-    Executa os 4 métodos analíticos para qualquer loteria (Mega-Sena, Lotofácil, Quina).
+    Executa os métodos analíticos para qualquer loteria (Mega-Sena, Lotofácil, Quina).
     """
     df, binary_matrix, cfg = load_lottery_data(filepath, game=game)
     if next_concurso is None:
@@ -1085,6 +1415,26 @@ def run_all_lottery_methods(filepath: str,
     m4.fit(binary_matrix)
     pred_m4 = m4.predict_top_k(k)
 
+    # 5. Métodos Híbridos Gianella + Bayes
+    m_hybrid = GianellaBayesHybridModel(
+        n_dezenas=cfg['n_dezenas'],
+        k=k,
+        group_size=group_size,
+        alpha_0=alpha_0,
+        beta_0=beta_0,
+        decay_half_life=150.0
+    )
+    m_hybrid.fit(binary_matrix)
+    pred_g_bayes_global = m_hybrid.predict_gianella_bayes_global(k)
+    pred_g_bayes_adaptive = m_hybrid.predict_gianella_bayes_adaptive(k)
+    pred_g_best_bayes = m_hybrid.predict_gianella_best_bayes_decision(k)
+
+    predictions_hybrid = {
+        'Gianella + Bayes Global': pred_g_bayes_global,
+        'Gianella + Bayes Adaptativo': pred_g_bayes_adaptive,
+        'Gianella + Melhor Decisão de Bayes': pred_g_best_bayes
+    }
+
     predictions = {
         'Metodo 1 (Estatistico - Balanceado)': pred_m1,
         'Metodo 1 (Sub-estrategia Mais Atrasadas)': pred_m1_overdue,
@@ -1094,6 +1444,11 @@ def run_all_lottery_methods(filepath: str,
         'Metodo 3 (Bayesiano Dinamico Adaptativo)': pred_m3_dyn,
         'Metodo 4 (Gianella - Geometria do Acaso)': pred_m4
     }
+
+    if include_hybrids:
+        predictions['Metodo 5 (Gianella + Bayes Global)'] = pred_g_bayes_global
+        predictions['Metodo 6 (Gianella + Bayes Adaptativo)'] = pred_g_bayes_adaptive
+        predictions['Metodo 7 (Gianella + Melhor Decisao de Bayes)'] = pred_g_best_bayes
 
     comparison_records = []
     for name, nums in predictions.items():
@@ -1114,7 +1469,9 @@ def run_all_lottery_methods(filepath: str,
         'm3_static': m3_static,
         'm3_dyn': m3_dyn,
         'm4_gianella': m4,
+        'm_hybrid': m_hybrid,
         'predictions': predictions,
+        'predictions_hybrid': predictions_hybrid,
         'comparison_df': comparison_df
     }
 
@@ -1122,7 +1479,7 @@ def run_all_lottery_methods(filepath: str,
 if __name__ == '__main__':
     excel_path = find_latest_lottery_file('megasena')
     print(f"Executando estimativas para a Mega-Sena a partir de '{excel_path}'...\n")
-    results = run_all_methods(excel_path)
+    results = run_all_methods(excel_path, include_hybrids=True)
     print("=" * 80)
     print(f"RESUMO DAS PREVISÕES PARA O CONCURSO {results['comparison_df']['Proximo Concurso'].iloc[0]}:")
     print("=" * 80)

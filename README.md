@@ -94,6 +94,11 @@ Cada notebook executa e compara **4 abordagens metodológicas**:
    * Modelagem combinatória baseada nas cores e gabaritos diofantinos de partição de inteiros.
    * Restrição do espaço de busca para as partições de maior probabilidade teórica.
 
+5. **Métodos Híbridos (Gianella & Teoria da Decisão Bayesiana):**
+   * **Gianella com Bayes Global:** Aloca as cotas diofantinas do gabarito combinatório de Gianella selecionando as dezenas que maximizam a esperança a posteriori conjugada global $\mathbb{E}[\theta_i \mid \text{dados}]$.
+   * **Gianella com Bayes Adaptativo:** Aplica o gabarito ótimo sobre as probabilidades a posteriori do modelo Bayesiano dinâmico com ponderação temporal exponencial ($\tau = 150$).
+   * **Gianella com a Melhor Decisão de Bayes:** Maximiza a utilidade esperada a posteriori sob a restrição combinatória do macro-estado mais provável: $\max_{a \in \mathcal{T}^*} \mathbb{E}[U(a, s) \mid \text{dados}]$, integrando o consenso bayesiano e minimização de risco/covariância.
+
 ---
 
 ## 📁 Estrutura do Repositório

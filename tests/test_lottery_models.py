@@ -17,6 +17,7 @@ from mega_sena_models import (
     MultiLabelMLModel,
     BayesianDecisionModel,
     GianellaColorTemplateModel,
+    GianellaBayesHybridModel,
     run_all_lottery_methods
 )
 
@@ -111,6 +112,63 @@ class TestModelsExecution:
         assert len(df_templates) > 0
         assert 'prob_teorica' in df_templates.columns
         assert 'freq_empirica_pct' in df_templates.columns
+
+    def test_gianella_bayes_hybrid_model(self, synthetic_data):
+        m_hybrid = GianellaBayesHybridModel(
+            n_dezenas=60, k=6, group_size=10, alpha_0=1.0, beta_0=9.0, decay_half_life=50.0
+        ).fit(synthetic_data)
+
+        # 1. Teste das três estratégias
+        top_global = m_hybrid.predict_gianella_bayes_global(6)
+        top_adapt = m_hybrid.predict_gianella_bayes_adaptive(6)
+        top_best = m_hybrid.predict_gianella_best_bayes_decision(6)
+
+        for name, bet in [('global', top_global), ('adaptive', top_adapt), ('best_bayes', top_best)]:
+            assert len(bet) == 6, f"Tamanho incorreto para {name}"
+            assert len(set(bet)) == 6, f"Dezenas duplicadas em {name}"
+            assert all(1 <= d <= 60 for d in bet), f"Dezenas fora do intervalo em {name}"
+
+        # 2. Teste via predict_top_k com strategies
+        assert m_hybrid.predict_top_k(6, strategy='bayes_global') == top_global
+        assert m_hybrid.predict_top_k(6, strategy='bayes_adaptive') == top_adapt
+        assert m_hybrid.predict_top_k(6, strategy='bayes_decision') == top_best
+
+        # 3. Teste com escores de consenso externos
+        consensus = np.random.uniform(0.1, 5.0, size=60)
+        m_hybrid_cons = GianellaBayesHybridModel(
+            n_dezenas=60, k=6, group_size=10
+        ).fit(synthetic_data, consensus_scores=consensus)
+        top_cons = m_hybrid_cons.predict_gianella_best_bayes_decision(6)
+        assert len(top_cons) == 6
+        assert len(set(top_cons)) == 6
+
+        # 4. Teste com penalidade de risco / covariância
+        m_risk = GianellaBayesHybridModel(
+            n_dezenas=60, k=6, group_size=10, risk_penalty=0.5
+        ).fit(synthetic_data)
+        top_risk = m_risk.predict_top_k(6, strategy='bayes_decision')
+        assert len(top_risk) == 6
+        assert len(set(top_risk)) == 6
+
+        # 5. Edge cases
+        assert len(m_hybrid.predict_top_k(0)) == 0
+        top70 = m_hybrid.predict_top_k(70)
+        assert len(top70) == 60
+        assert len(set(top70)) == 60
+
+        with pytest.raises(ValueError):
+            m_hybrid.predict_top_k(6, strategy='invalid_strategy')
+        with pytest.raises(ValueError):
+            GianellaBayesHybridModel(n_dezenas=60).fit(np.zeros((0, 60)))
+        with pytest.raises(ValueError):
+            GianellaBayesHybridModel(n_dezenas=60).fit(np.zeros((10, 25)))
+
+        # 6. DataFrame de sumário
+        summary_df = m_hybrid.get_summary_df()
+        assert len(summary_df) == 60
+        assert 'prob_bayes_global' in summary_df.columns
+        assert 'prob_bayes_adaptativo' in summary_df.columns
+        assert 'escore_melhor_decisao' in summary_df.columns
 
 
 class TestNotebooksIntegrity:
