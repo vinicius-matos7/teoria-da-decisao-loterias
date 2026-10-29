@@ -897,6 +897,12 @@ class GianellaColorTemplateModel:
       (maior entropia combinatória), preenchendo as cores mais ativas com as melhores dezenas.
     """
     def __init__(self, n_dezenas: int = 60, k: int = 6, group_size: int = 10, random_state: int = 42):
+        if n_dezenas <= 0 or k <= 0 or group_size <= 0:
+            raise ValueError(f"n_dezenas ({n_dezenas}), k ({k}) e group_size ({group_size}) devem ser > 0.")
+        if k > n_dezenas:
+            raise ValueError(f"k ({k}) não pode ser maior que n_dezenas ({n_dezenas}).")
+        if n_dezenas % group_size != 0:
+            raise ValueError(f"n_dezenas ({n_dezenas}) deve ser divisível por group_size ({group_size}) para formar grupos regulares de cores.")
         self.n_dezenas = n_dezenas
         self.k = k
         self.group_size = group_size
@@ -1085,6 +1091,10 @@ class GianellaBayesHybridModel:
                  random_state: int = 42):
         if n_dezenas <= 0 or k <= 0 or group_size <= 0:
             raise ValueError(f"n_dezenas ({n_dezenas}), k ({k}) e group_size ({group_size}) devem ser > 0.")
+        if k > n_dezenas:
+            raise ValueError(f"k ({k}) não pode ser maior que n_dezenas ({n_dezenas}).")
+        if n_dezenas % group_size != 0:
+            raise ValueError(f"n_dezenas ({n_dezenas}) deve ser divisível por group_size ({group_size}) para formar grupos regulares de cores.")
         if alpha_0 <= 0 or beta_0 <= 0:
             raise ValueError(f"alpha_0 ({alpha_0}) e beta_0 ({beta_0}) devem ser > 0.")
         if decay_half_life <= 0:
@@ -1205,7 +1215,7 @@ class GianellaBayesHybridModel:
                 end = (color_idx + 1) * self.group_size
                 group_dezenas = np.arange(start, end)
 
-                if self.risk_penalty > 0.0 and self.cov_matrix_ is not None and selected_dezenas:
+                if self.risk_penalty > 0.0 and self.cov_matrix_ is not None:
                     # Seleção gananciosa com penalização de covariância
                     group_cand = list(group_dezenas)
                     picks: List[int] = []
@@ -1213,8 +1223,9 @@ class GianellaBayesHybridModel:
                         best_gain = -np.inf
                         best_c = None
                         for cand in group_cand:
+                            prior_selected = [s - 1 for s in selected_dezenas] + picks
                             cov_pen = self.risk_penalty * sum(
-                                self.cov_matrix_[cand, s - 1] for s in selected_dezenas + [p + 1 for p in picks]
+                                self.cov_matrix_[cand, s] for s in prior_selected
                             )
                             gain = dezena_scores[cand] - cov_pen
                             if gain > best_gain:
@@ -1339,12 +1350,66 @@ def predict_gianella_bayes_adaptive(binary_matrix: np.ndarray,
     return model.predict_gianella_bayes_adaptive(k)
 
 
+def compute_ensemble_consensus_scores(binary_matrix: np.ndarray,
+                                      cfg: Dict,
+                                      k: Optional[int] = None) -> np.ndarray:
+    """
+    Calcula os escores ponderados do consenso multi-modelo (Decisão Ótima de Bayes)
+    combinando M1 (Balanceado, Atraso, Momentum), M2 (ML), M3 (Bayes Global e Adaptativo) e M4 (Gianella).
+    """
+    n_dezenas = cfg['n_dezenas']
+    k_eval = cfg['k'] if k is None else k
+    alpha_0 = cfg.get('alpha_0', 1.0)
+    beta_0 = cfg.get('beta_0', 1.0)
+    group_size = cfg.get('gianella_group_size', 10)
+
+    # M1
+    m1 = FrequencyDelayModel(half_life=100.0, alpha=0.5)
+    m1.fit(binary_matrix)
+    pred_m1 = m1.predict_top_k(k_eval, strategy='balanced')
+
+    # M2
+    m2 = MultiLabelMLModel(estimator='logistic_regression', random_state=42)
+    m2.fit(binary_matrix)
+    pred_m2 = m2.predict_top_k(k_eval)
+
+    # M3
+    m3_static = BayesianDecisionModel(alpha_0=alpha_0, beta_0=beta_0)
+    m3_static.fit(binary_matrix)
+    pred_m3_static = m3_static.predict_top_k(k_eval)
+
+    m3_dyn = BayesianDecisionModel(alpha_0=alpha_0, beta_0=beta_0, decay_half_life=150.0)
+    m3_dyn.fit(binary_matrix)
+    pred_m3_dyn = m3_dyn.predict_top_k(k_eval)
+
+    # M4
+    m4 = GianellaColorTemplateModel(n_dezenas=n_dezenas, k=k_eval, group_size=group_size)
+    m4.fit(binary_matrix)
+    pred_m4 = m4.predict_top_k(k_eval)
+
+    vote_weights = {
+        'm1': (pred_m1, 1.0),
+        'm2': (pred_m2, 2.0),
+        'm3_static': (pred_m3_static, 2.5),
+        'm3_dyn': (pred_m3_dyn, 2.5),
+        'm4': (pred_m4, 1.5)
+    }
+    ball_scores = np.zeros(n_dezenas, dtype=float)
+    for _, (preds, w) in vote_weights.items():
+        for ball in preds:
+            ball_scores[ball - 1] += w
+    return ball_scores
+
+
 def predict_gianella_best_bayes_decision(binary_matrix: np.ndarray,
                                          cfg: Dict,
                                          k: Optional[int] = None,
                                          decay_half_life: float = 150.0,
                                          consensus_scores: Optional[np.ndarray] = None) -> List[int]:
     """Predição direta unindo o Gabarito de Gianella com a Melhor Decisão de Bayes."""
+    if consensus_scores is None:
+        consensus_scores = compute_ensemble_consensus_scores(binary_matrix, cfg, k=k)
+
     model = GianellaBayesHybridModel(
         n_dezenas=cfg['n_dezenas'],
         k=cfg['k'] if k is None else k,
@@ -1415,6 +1480,20 @@ def run_all_lottery_methods(filepath: str,
     m4.fit(binary_matrix)
     pred_m4 = m4.predict_top_k(k)
 
+    # Consenso Bayesiano Multi-Modelo (Decisão Ótima de Bayes)
+    vote_weights = {
+        'm1': (pred_m1, 1.0),
+        'm2': (pred_m2, 2.0),
+        'm3_static': (pred_m3_static, 2.5),
+        'm3_dyn': (pred_m3_dyn, 2.5),
+        'm4': (pred_m4, 1.5)
+    }
+    ball_scores = np.zeros(cfg['n_dezenas'], dtype=float)
+    for _, (preds, w) in vote_weights.items():
+        for ball in preds:
+            ball_scores[ball - 1] += w
+    pred_consenso = sorted(list(np.argsort(ball_scores)[::-1][:k] + 1))
+
     # 5. Métodos Híbridos Gianella + Bayes
     m_hybrid = GianellaBayesHybridModel(
         n_dezenas=cfg['n_dezenas'],
@@ -1424,7 +1503,7 @@ def run_all_lottery_methods(filepath: str,
         beta_0=beta_0,
         decay_half_life=150.0
     )
-    m_hybrid.fit(binary_matrix)
+    m_hybrid.fit(binary_matrix, consensus_scores=ball_scores)
     pred_g_bayes_global = m_hybrid.predict_gianella_bayes_global(k)
     pred_g_bayes_adaptive = m_hybrid.predict_gianella_bayes_adaptive(k)
     pred_g_best_bayes = m_hybrid.predict_gianella_best_bayes_decision(k)
@@ -1446,6 +1525,7 @@ def run_all_lottery_methods(filepath: str,
     }
 
     if include_hybrids:
+        predictions['Decisao Otima de Bayes (Consenso)'] = pred_consenso
         predictions['Metodo 5 (Gianella + Bayes Global)'] = pred_g_bayes_global
         predictions['Metodo 6 (Gianella + Bayes Adaptativo)'] = pred_g_bayes_adaptive
         predictions['Metodo 7 (Gianella + Melhor Decisao de Bayes)'] = pred_g_best_bayes
@@ -1470,6 +1550,8 @@ def run_all_lottery_methods(filepath: str,
         'm3_dyn': m3_dyn,
         'm4_gianella': m4,
         'm_hybrid': m_hybrid,
+        'pred_consenso': pred_consenso,
+        'consensus_scores': ball_scores,
         'predictions': predictions,
         'predictions_hybrid': predictions_hybrid,
         'comparison_df': comparison_df

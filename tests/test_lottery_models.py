@@ -18,6 +18,9 @@ from mega_sena_models import (
     BayesianDecisionModel,
     GianellaColorTemplateModel,
     GianellaBayesHybridModel,
+    predict_gianella_bayes_global,
+    predict_gianella_bayes_adaptive,
+    predict_gianella_best_bayes_decision,
     run_all_lottery_methods
 )
 
@@ -150,7 +153,30 @@ class TestModelsExecution:
         assert len(top_risk) == 6
         assert len(set(top_risk)) == 6
 
-        # 5. Edge cases
+        # 4b. Teste específico de penalização de covariância no grupo 0
+        X_corr = np.zeros((100, 60))
+        coin = np.random.binomial(1, 0.5, size=100)
+        X_corr[:, 0] = coin
+        X_corr[:, 1] = coin  # cov(0, 1) positiva alta (~0.25)
+        X_corr[:, 2] = np.random.binomial(1, 0.48, size=100)  # cov com 0 ~ 0
+        m_risk_corr = GianellaBayesHybridModel(
+            n_dezenas=60, k=6, group_size=10, risk_penalty=10.0
+        ).fit(X_corr)
+        top_risk_corr = m_risk_corr.predict_top_k(6, strategy='bayes_decision', template=(2, 1, 1, 1, 1, 0))
+        g0_picks = [b for b in top_risk_corr if b <= 10]
+        assert g0_picks == [1, 3], f"Esperado penalizar dezena 2 em favor da dezena 3, obtido {g0_picks}"
+
+        # 5. Funções utilitárias diretas
+        cfg_test = {'n_dezenas': 60, 'k': 6, 'gianella_group_size': 10, 'alpha_0': 1.0, 'beta_0': 9.0}
+        fn_global = predict_gianella_bayes_global(synthetic_data, cfg_test, k=6)
+        fn_adapt = predict_gianella_bayes_adaptive(synthetic_data, cfg_test, k=6)
+        fn_best = predict_gianella_best_bayes_decision(synthetic_data, cfg_test, k=6)
+        for fn_bet in [fn_global, fn_adapt, fn_best]:
+            assert len(fn_bet) == 6
+            assert len(set(fn_bet)) == 6
+            assert all(1 <= d <= 60 for d in fn_bet)
+
+        # 6. Edge cases e validações
         assert len(m_hybrid.predict_top_k(0)) == 0
         top70 = m_hybrid.predict_top_k(70)
         assert len(top70) == 60
@@ -162,8 +188,16 @@ class TestModelsExecution:
             GianellaBayesHybridModel(n_dezenas=60).fit(np.zeros((0, 60)))
         with pytest.raises(ValueError):
             GianellaBayesHybridModel(n_dezenas=60).fit(np.zeros((10, 25)))
+        with pytest.raises(ValueError):
+            GianellaBayesHybridModel(n_dezenas=60, k=70)
+        with pytest.raises(ValueError):
+            GianellaBayesHybridModel(n_dezenas=53, group_size=10)
+        with pytest.raises(ValueError):
+            GianellaColorTemplateModel(n_dezenas=60, k=70)
+        with pytest.raises(ValueError):
+            GianellaColorTemplateModel(n_dezenas=53, group_size=10)
 
-        # 6. DataFrame de sumário
+        # 7. DataFrame de sumário
         summary_df = m_hybrid.get_summary_df()
         assert len(summary_df) == 60
         assert 'prob_bayes_global' in summary_df.columns
@@ -222,6 +256,38 @@ class TestRunAllLotteryMethods:
             assert len(bet) == expected_k, f"Tamanho incorreto para {name}: {len(bet)} != {expected_k}"
             assert len(set(bet)) == expected_k, f"Dezenas duplicadas em {name}: {bet}"
             assert all(1 <= d <= expected_n for d in bet), f"Dezena fora da faixa [1, {expected_n}] em {name}: {bet}"
+
+    @pytest.mark.parametrize("game,expected_k,expected_n", [
+        ("megasena", 6, 60),
+        ("lotofacil", 15, 25),
+        ("quina", 5, 80)
+    ])
+    def test_run_all_lottery_methods_with_hybrids(self, game, expected_k, expected_n):
+        filepath = find_latest_lottery_file(game, search_dir=os.path.join(BASE_DIR, 'excel'))
+        assert os.path.exists(filepath), f"Arquivo não encontrado: {filepath}"
+
+        results = run_all_lottery_methods(filepath, game=game, include_hybrids=True)
+        assert isinstance(results, dict)
+
+        required_keys = ['df_raw', 'binary_matrix', 'cfg', 'm1_model', 'm2_model',
+                         'm3_static', 'm3_dyn', 'm4_gianella', 'm_hybrid', 'pred_consenso',
+                         'consensus_scores', 'predictions', 'predictions_hybrid', 'comparison_df']
+        for k in required_keys:
+            assert k in results, f"Chave {k} ausente em results"
+
+        assert len(results['predictions']) == 11
+        assert len(results['comparison_df']) == 11
+        assert len(results['predictions_hybrid']) == 3
+
+        for name, bet in results['predictions'].items():
+            assert len(bet) == expected_k, f"Tamanho incorreto para {name}: {len(bet)} != {expected_k}"
+            assert len(set(bet)) == expected_k, f"Dezenas duplicadas em {name}: {bet}"
+            assert all(1 <= d <= expected_n for d in bet), f"Dezena fora da faixa [1, {expected_n}] em {name}: {bet}"
+
+        for name, bet in results['predictions_hybrid'].items():
+            assert len(bet) == expected_k
+            assert len(set(bet)) == expected_k
+            assert all(1 <= d <= expected_n for d in bet)
 
 
 class TestGeneratedGraphics:
