@@ -15,7 +15,7 @@ import os
 import sys
 import glob
 import re
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any, Generator
 
 # No Windows com Anaconda/Miniconda, garante que Library/bin esteja no PATH e registrado para carregar MKL/BLAS DLLs
 if sys.platform == 'win32':
@@ -1850,26 +1850,900 @@ def predict_bayes_adaptive_balanced(binary_matrix: np.ndarray, cfg: Dict, k: Opt
 
 
 # ==============================================================================
+# 3.7. MÉTODOS ENSEMBLE (GÉRON, CAPÍTULO 7: ENSEMBLE LEARNING AND RANDOM FORESTS)
+# Bagging (Bootstrap Aggregating), AdaBoost (Adaptive Boosting) e Gradient Boosting (Residual Boosting)
+# ==============================================================================
+
+def _extract_base_model_scores(model_name: str,
+                               binary_matrix: np.ndarray,
+                               cfg: Dict,
+                               seed: int = 42) -> np.ndarray:
+    """
+    Função utilitária interna para ajustar um dos métodos analíticos existentes
+    ('esses métodos que estão aí') sobre uma matriz de dados e retornar o vetor
+    de escores normalizados no intervalo [0, 1] para todas as dezenas.
+    """
+    n_concursos, n_dezenas = binary_matrix.shape
+    scores = np.zeros(n_dezenas, dtype=float)
+
+    if model_name == 'm1_balanced':
+        m = FrequencyDelayModel(half_life=100.0, alpha=0.5).fit(binary_matrix)
+        for _, r in m.scores_df_.iterrows():
+            scores[int(r['dezena']) - 1] = float(r['escore_composto'])
+    elif model_name == 'm1_momentum':
+        m = FrequencyDelayModel(half_life=100.0, alpha=0.5).fit(binary_matrix)
+        for _, r in m.scores_df_.iterrows():
+            scores[int(r['dezena']) - 1] = float(r['freq_ponderada'])
+    elif model_name == 'm1_overdue':
+        m = FrequencyDelayModel(half_life=100.0, alpha=0.5).fit(binary_matrix)
+        for _, r in m.scores_df_.iterrows():
+            scores[int(r['dezena']) - 1] = float(r['razao_atraso'])
+    elif model_name == 'm2_logistic':
+        try:
+            min_h = min(50, max(10, n_concursos // 4))
+            m = MultiLabelMLModel(estimator='logistic_regression', windows=[5, 25],
+                                  min_train_history=min_h, random_state=seed).fit(binary_matrix)
+            for _, r in m.probabilities_df_.iterrows():
+                scores[int(r['dezena']) - 1] = float(r['probabilidade_calibrada_sorteio'])
+        except Exception:
+            return _extract_base_model_scores('m1_momentum', binary_matrix, cfg, seed)
+    elif model_name == 'm3_global':
+        m = BayesianDecisionModel(alpha_0=cfg.get('alpha_0', 1.0),
+                                  beta_0=cfg.get('beta_0', 9.0)).fit(binary_matrix)
+        for _, r in m.posterior_df_.iterrows():
+            scores[int(r['dezena']) - 1] = float(r['esperanca_posteriori'])
+    elif model_name == 'm3_adaptive':
+        m = BayesianDecisionModel(alpha_0=cfg.get('alpha_0', 1.0),
+                                  beta_0=cfg.get('beta_0', 9.0),
+                                  decay_half_life=150.0).fit(binary_matrix)
+        for _, r in m.posterior_df_.iterrows():
+            scores[int(r['dezena']) - 1] = float(r['esperanca_posteriori'])
+    elif model_name == 'm4_gianella':
+        try:
+            m = GianellaColorTemplateModel(
+                n_dezenas=n_dezenas,
+                k=cfg.get('k', 6),
+                group_size=cfg.get('gianella_group_size', 10)
+            ).fit(binary_matrix)
+            scores = m.dezena_scores_.copy()
+        except Exception:
+            return _extract_base_model_scores('m3_global', binary_matrix, cfg, seed)
+    else:
+        raise ValueError(f"Modelo base desconhecido: '{model_name}'")
+
+    return _min_max_scale(scores)
+
+
+class LotteryBaggingModel:
+    """
+    Ensemble Bagging (Bootstrap Aggregating) para Seleção de Dezenas em Loterias.
+    Baseado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 7:
+    'Bagging and Pasting' (Leo Breiman, 1996, 'Bagging Predictors').
+
+    Fundamentação Teórica:
+    - Amostragem com reposição (Bootstrap) de m concursos a partir da base histórica total D:
+      D_1, D_2, ..., D_B, onde |D_b| = max_samples * |D|.
+    - Cada estimador de base é treinado de forma independente sobre uma réplica bootstrap,
+      reduzindo a variância das estimativas probabilísticas sem aumentar o viés (Breiman, 1996).
+    - Avaliação Out-of-Bag (OOB): em média ~36.8% dos concursos de treinamento não são amostrados
+      em uma dada réplica b (pois lim_{m->inf} (1 - 1/m)^m = e^{-1} approx 0.368, Géron p. 195).
+      Esses concursos são usados como conjunto de validação independente para calcular o oob_score_.
+    - Agregação por Votação Suave (Soft Voting): média das pontuações normalizadas geradas pelas réplicas.
+    - Suporta também Votação Rígida (Hard Voting): apuração por contagem de votos das top-k dezenas.
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 max_samples: float = 1.0,
+                 voting: str = 'soft',
+                 oob_score: bool = True,
+                 random_state: int = 42,
+                 base_models: Optional[List[str]] = None):
+        """
+        Parameters
+        ----------
+        n_estimators : int
+            Número de réplicas bootstrap a treinar (default 10).
+        max_samples : float
+            Fração de concursos a amostrar com reposição em cada réplica (default 1.0).
+        voting : str
+            'soft' (default, média das probabilidades/escores) ou 'hard' (votação majoritária de dezenas).
+        oob_score : bool
+            Se True, calcula a avaliação Out-of-Bag (acerto médio nos sorteios não sorteados no bootstrap).
+        random_state : int
+            Semente para amostragem pseudo-aleatória.
+        base_models : Optional[List[str]]
+            Lista de nomes dos modelos de base a alternar entre as réplicas bootstrap.
+        """
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser estritamente positivo (> 0). Recebido: {n_estimators}")
+        if not (0.0 < max_samples <= 1.0):
+            raise ValueError(f"max_samples deve estar no intervalo (0, 1]. Recebido: {max_samples}")
+        if voting not in ('soft', 'hard'):
+            raise ValueError(f"voting deve ser 'soft' ou 'hard'. Recebido: {voting}")
+
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+        self.voting = voting
+        self.oob_score = oob_score
+        self.random_state = random_state
+        self.base_models = base_models or [
+            'm1_balanced', 'm1_momentum', 'm2_logistic',
+            'm3_global', 'm3_adaptive', 'm4_gianella'
+        ]
+
+        self.estimators_: List[Dict[str, Any]] = []
+        self.oob_score_: float = 0.0
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryBaggingModel':
+        """
+        Ajusta o ensemble Bagging gerando réplicas bootstrap dos concursos históricos.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+        rng = np.random.RandomState(self.random_state)
+        m_samples = max(1, int(self.max_samples * n_concursos))
+
+        self.estimators_ = []
+        all_scores: List[np.ndarray] = []
+        all_top_k: List[List[int]] = []
+        oob_hits_total = 0
+        oob_eval_count = 0
+
+        for b in range(self.n_estimators):
+            boot_idx = rng.choice(n_concursos, size=m_samples, replace=True)
+            oob_idx = np.setdiff1d(np.arange(n_concursos), boot_idx)
+            X_b = binary_matrix[boot_idx]
+
+            model_name = self.base_models[b % len(self.base_models)]
+            s_b = _extract_base_model_scores(model_name, X_b, cfg, seed=self.random_state + b)
+            all_scores.append(s_b)
+
+            top_b = sorted(list(np.argsort(s_b)[::-1][:k] + 1))
+            all_top_k.append(top_b)
+            self.estimators_.append({
+                'estimator_idx': b,
+                'model_name': model_name,
+                'scores': s_b,
+                'top_k': top_b,
+                'n_oob': len(oob_idx)
+            })
+
+            # Avaliação Out-of-Bag (OOB)
+            if self.oob_score and len(oob_idx) > 0:
+                top_b_set = set(top_b)
+                for idx_oob in oob_idx:
+                    drawn = set(np.where(binary_matrix[idx_oob] == 1)[0] + 1)
+                    oob_hits_total += len(top_b_set & drawn)
+                    oob_eval_count += 1
+
+        self.oob_score_ = float(oob_hits_total / oob_eval_count) if oob_eval_count > 0 else 0.0
+
+        soft_scores = np.mean(all_scores, axis=0)
+        hard_votes = np.zeros(n_dezenas, dtype=float)
+        for top_b in all_top_k:
+            for dez in top_b:
+                hard_votes[dez - 1] += 1.0
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_bagging': np.round(soft_scores, 5),
+            'votos_hard': hard_votes.astype(int)
+        }).sort_values('escore_bagging', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None, voting: Optional[str] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo ensemble Bagging.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+
+        use_voting = voting or self.voting
+        if use_voting == 'hard':
+            df_sorted = self.scores_df_.sort_values(['votos_hard', 'escore_bagging'], ascending=[False, False])
+        else:
+            df_sorted = self.scores_df_.sort_values('escore_bagging', ascending=False)
+
+        return sorted(df_sorted.head(k)['dezena'].tolist())
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do Bagging."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+class LotteryPastingModel:
+    """
+    Ensemble Pasting (Non-replacement Aggregating) para Seleção de Dezenas em Loterias.
+    Baseado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 7:
+    'Bagging and Pasting' (Leo Breiman, 1999, 'Pasting Small Votes for Classification in Large Databases and On-Line').
+
+    Fundamentação Teórica:
+    - Amostragem sem reposição (Non-replacement Sampling) de instâncias a partir da base histórica total D:
+      D_1, D_2, ..., D_B, onde |D_b| = max_samples * |D| e cada concurso aparece no máximo uma vez em cada réplica.
+    - Preserva a estrutura ordinal/temporal sem duplicatas artificiais dentro de cada subconjunto de treinamento.
+    - Diferença fundamental para o Bagging (Breiman 1996 vs Breiman 1999):
+      Bagging usa bootstrap (com reposição), enquanto Pasting realiza partição aleatória sem reposição,
+      fornecendo estimativas com menor viés em cada subamostra, agregadas por soft ou hard voting.
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 max_samples: float = 0.8,
+                 voting: str = 'soft',
+                 random_state: int = 42,
+                 base_models: Optional[List[str]] = None):
+        """
+        Parameters
+        ----------
+        n_estimators : int
+            Número de réplicas de subamostras sem reposição (default 10).
+        max_samples : float
+            Fração de concursos a amostrar SEM reposição em cada estimador (default 0.8).
+        voting : str
+            'soft' (default, média das pontuações/probabilidades) ou 'hard' (votação majoritária de dezenas).
+        random_state : int
+            Semente para amostragem pseudo-aleatória.
+        base_models : Optional[List[str]]
+            Lista de nomes dos modelos de base a alternar entre as réplicas.
+        """
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser estritamente positivo (> 0). Recebido: {n_estimators}")
+        if not (0.0 < max_samples <= 1.0):
+            raise ValueError(f"max_samples deve estar no intervalo (0, 1]. Recebido: {max_samples}")
+        if voting not in ('soft', 'hard'):
+            raise ValueError(f"voting deve ser 'soft' ou 'hard'. Recebido: {voting}")
+
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+        self.voting = voting
+        self.random_state = random_state
+        self.base_models = base_models or [
+            'm1_balanced', 'm1_momentum', 'm2_logistic',
+            'm3_global', 'm3_adaptive', 'm4_gianella'
+        ]
+
+        self.estimators_: List[Dict[str, Any]] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryPastingModel':
+        """
+        Ajusta o ensemble Pasting gerando réplicas sem reposição dos concursos históricos.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+        rng = np.random.RandomState(self.random_state)
+        m_samples = max(1, int(self.max_samples * n_concursos))
+
+        self.estimators_ = []
+        all_scores: List[np.ndarray] = []
+        all_top_k: List[List[int]] = []
+
+        for b in range(self.n_estimators):
+            # Amostragem SEM reposição (Pasting, Breiman 1999)
+            paste_idx = rng.choice(n_concursos, size=m_samples, replace=False)
+            paste_idx = np.sort(paste_idx)  # Preserva coerência cronológica
+            X_b = binary_matrix[paste_idx]
+
+            model_name = self.base_models[b % len(self.base_models)]
+            s_b = _extract_base_model_scores(model_name, X_b, cfg, seed=self.random_state + b)
+            all_scores.append(s_b)
+
+            top_b = sorted(list(np.argsort(s_b)[::-1][:k] + 1))
+            all_top_k.append(top_b)
+            self.estimators_.append({
+                'estimator_idx': b,
+                'model_name': model_name,
+                'scores': s_b,
+                'top_k': top_b,
+                'n_samples': m_samples
+            })
+
+        soft_scores = np.mean(all_scores, axis=0)
+        hard_votes = np.zeros(n_dezenas, dtype=float)
+        for top_b in all_top_k:
+            for dez in top_b:
+                hard_votes[dez - 1] += 1.0
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_pasting': np.round(soft_scores, 5),
+            'votos_hard': hard_votes.astype(int)
+        }).sort_values('escore_pasting', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None, voting: Optional[str] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo ensemble Pasting.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+
+        use_voting = voting or self.voting
+        if use_voting == 'hard':
+            df_sorted = self.scores_df_.sort_values(['votos_hard', 'escore_pasting'], ascending=[False, False])
+        else:
+            df_sorted = self.scores_df_.sort_values('escore_pasting', ascending=False)
+
+        return sorted(df_sorted.head(k)['dezena'].tolist())
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do Pasting."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+class LotteryAdaBoostModel:
+    """
+    Ensemble AdaBoost (Adaptive Boosting) para Seleção de Dezenas em Loterias.
+    Baseado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 7:
+    'Boosting - AdaBoost' (Yoav Freund & Robert E. Schapire, 1997).
+
+    Fundamentação Matemática e Algorítmica:
+    1. Pesos das Instâncias (Concursos Históricos):
+       Inicialmente, w_i^{(1)} = 1 / m para todo concurso i in {1, ..., m} (Géron p. 201).
+    2. Taxa de Erro Ponderada do j-ésimo preditor (Equação 7-1):
+       r_j = (sum_{i=1}^m w_i^{(j)} * e_{j, i}) / (sum_{i=1}^m w_i^{(j)})
+       onde e_{j, i} = 1 - (acertos_{j, i} / k) in [0, 1] é a taxa de erro empírica no concurso i.
+    3. Peso do Preditor alpha_j (Equação 7-2 com taxa de aprendizado eta):
+       alpha_j = eta * 0.5 * ln((1 - r_j) / r_j)
+       Preditores mais precisos recebem peso alpha_j significativamente maior no voto do ensemble.
+    4. Atualização e Normalização dos Pesos das Instâncias (Equação 7-3):
+       w_i^{(j+1)} = w_i^{(j)} * exp(alpha_j * e_{j, i})
+       w_i^{(j+1)} = w_i^{(j+1)} / sum_l w_l^{(j+1)}
+       Concursos difíceis (onde os modelos anteriores erraram mais) têm seus pesos aumentados,
+       forçando os próximos preditores a focarem nos padrões não antecipados.
+    5. Predição Combinada do Ensemble (Equação 7-4):
+       Score(d) = sum_{j=1}^M alpha_j * S_j(d)
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 learning_rate: float = 1.0,
+                 random_state: int = 42,
+                 base_models: Optional[List[str]] = None):
+        """
+        Parameters
+        ----------
+        n_estimators : int
+            Número de rodadas sequenciais de boosting (default 10).
+        learning_rate : float
+            Taxa de aprendizado eta que escala o peso de cada preditor (default 1.0).
+        random_state : int
+            Semente para reprodutibilidade da amostragem ponderada.
+        base_models : Optional[List[str]]
+            Conjunto de modelos analíticos existentes para utilizar no boosting.
+        """
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser estritamente positivo (> 0). Recebido: {n_estimators}")
+        if learning_rate <= 0:
+            raise ValueError(f"learning_rate deve ser estritamente positivo (> 0). Recebido: {learning_rate}")
+
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.random_state = random_state
+        self.base_models = base_models or [
+            'm1_balanced', 'm1_momentum', 'm1_overdue',
+            'm3_global', 'm3_adaptive', 'm4_gianella'
+        ]
+
+        self.estimators_: List[Dict[str, Any]] = []
+        self.estimator_weights_: Optional[np.ndarray] = None
+        self.estimator_errors_: Optional[np.ndarray] = None
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryAdaBoostModel':
+        """
+        Ajusta sequencialmente o AdaBoost sobre os sorteios históricos com reponderação de instâncias.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+        rng = np.random.RandomState(self.random_state)
+
+        # 1. Pesos iniciais uniformes das instâncias (Géron p. 201)
+        w = np.full(n_concursos, 1.0 / n_concursos, dtype=float)
+
+        self.estimators_ = []
+        weights_list: List[float] = []
+        errors_list: List[float] = []
+        combined_scores = np.zeros(n_dezenas, dtype=float)
+
+        for j in range(self.n_estimators):
+            # Amostra concursos guiada pela distribuição de pesos w (foco nos casos difíceis)
+            sample_idx = rng.choice(n_concursos, size=n_concursos, replace=True, p=w)
+            X_sample = binary_matrix[sample_idx]
+
+            model_name = self.base_models[j % len(self.base_models)]
+            s_j = _extract_base_model_scores(model_name, X_sample, cfg, seed=self.random_state + j)
+            top_j = sorted(list(np.argsort(s_j)[::-1][:k] + 1))
+            top_j_set = set(top_j)
+
+            # 2. Avaliação de erro de predição nas instâncias de treino (Géron Eq 7-1)
+            errors = np.zeros(n_concursos, dtype=float)
+            for i in range(n_concursos):
+                drawn_i = set(np.where(binary_matrix[i] == 1)[0] + 1)
+                hits_i = len(top_j_set & drawn_i)
+                errors[i] = 1.0 - (hits_i / float(k))
+
+            # Taxa de erro ponderada r_j
+            r_j = float(np.sum(w * errors) / np.sum(w))
+            r_j = max(1e-6, min(1.0 - 1e-6, r_j))
+
+            # 3. Peso do preditor alpha_j (Géron Eq 7-2)
+            alpha_j = float(self.learning_rate * 0.5 * np.log((1.0 - r_j) / r_j))
+            if alpha_j < 0.01:
+                alpha_j = 0.01
+
+            # 4. Atualização dos pesos das instâncias (Géron Eq 7-3)
+            w = w * np.exp(alpha_j * errors)
+            w = w / np.sum(w)  # Normalização
+
+            self.estimators_.append({
+                'stage': j,
+                'model_name': model_name,
+                'alpha': alpha_j,
+                'error': r_j,
+                'scores': s_j,
+                'top_k': top_j
+            })
+            weights_list.append(alpha_j)
+            errors_list.append(r_j)
+
+            combined_scores += alpha_j * s_j
+
+        self.estimator_weights_ = np.array(weights_list)
+        self.estimator_errors_ = np.array(errors_list)
+
+        norm_scores = _min_max_scale(combined_scores)
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_adaboost': np.round(norm_scores, 5),
+            'escore_ponderado_bruto': np.round(combined_scores, 5)
+        }).sort_values('escore_adaboost', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo AdaBoost ponderado.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted(self.scores_df_.head(k)['dezena'].tolist())
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do AdaBoost."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+class LotteryGradientBoostingModel:
+    """
+    Ensemble Gradient Boosting (Residual Boosting) para Seleção de Dezenas em Loterias.
+    Baseado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 7:
+    'Boosting - Gradient Boosting' (Jerome H. Friedman, 1999; Leo Breiman, 1997).
+
+    Fundamentação Teórica e Formulação Matemática:
+    1. Ajuste Sequencial aos Erros Residuais (Gradiente Negativo):
+       Diferente do AdaBoost (que atualiza pesos de instâncias), o Gradient Boosting ajusta cada novo
+       preditor h_m diretamente aos resíduos deixados pelo preditor anterior (Géron p. 203-204):
+       R^{(0)} = Y - F_0
+       h_m approx R^{(m-1)}
+       F_m = F_{m-1} + eta * h_m
+       R^{(m)} = R^{(m-1)} - eta * h_m
+    2. Modelo Inicial F_0:
+       Estimativa suavizada a priori baseada na esperança da conjugada Bayesiana global (Método 3).
+    3. Regularização por Encolhimento (Shrinkage, Géron p. 205):
+       O hiperparâmetro learning_rate (eta in (0, 1]) escala a contribuição de cada etapa,
+       forçando o modelo a aprender representações graduais e evitando sobreajuste.
+    4. Predição Estagiada (Staged Predict, Géron p. 206):
+       Permite inspecionar a evolução e o refinamento do palpite etapa a etapa (staged_predict_top_k).
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 learning_rate: float = 0.5,
+                 random_state: int = 42,
+                 base_models: Optional[List[str]] = None):
+        """
+        Parameters
+        ----------
+        n_estimators : int
+            Número de estágios de ajuste residual sequencial (default 10).
+        learning_rate : float
+            Taxa de aprendizado / encolhimento eta (default 0.5).
+        random_state : int
+            Semente para reprodutibilidade.
+        base_models : Optional[List[str]]
+            Lista de estratégias de resíduo a utilizar.
+        """
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser estritamente positivo (> 0). Recebido: {n_estimators}")
+        if learning_rate <= 0:
+            raise ValueError(f"learning_rate deve ser estritamente positivo (> 0). Recebido: {learning_rate}")
+
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.random_state = random_state
+        self.base_models = base_models or ['residual_momentum', 'residual_delay', 'residual_bayes', 'residual_ml']
+
+        self.staged_scores_: List[np.ndarray] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryGradientBoostingModel':
+        """
+        Ajusta sequencialmente o Gradient Boosting aos resíduos do histórico.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+
+        # 1. Modelo inicial F_0: Esperança a priori / posteriori bayesiana suavizada
+        alpha_0 = cfg.get('alpha_0', 1.0)
+        beta_0 = cfg.get('beta_0', 9.0)
+        F_current = (binary_matrix.sum(axis=0) + alpha_0) / (n_concursos + alpha_0 + beta_0)
+        F_current = _min_max_scale(F_current)
+
+        # Resíduos iniciais: R_{t, d} = Y_{t, d} - F_current(d)
+        residuals = binary_matrix.astype(float) - F_current[None, :]
+        self.staged_scores_ = [F_current.copy()]
+
+        for m in range(self.n_estimators):
+            # 2. Ajuste do preditor de resíduos h_m (Géron p. 204)
+            # Ponderação temporal adaptativa sobre os resíduos recentes (momentum residual)
+            half_life = 50.0 + (m * 20.0)
+            decay = 0.5 ** (1.0 / half_life)
+            time_weights = decay ** np.arange(n_concursos - 1, -1, -1)
+            time_weights /= np.sum(time_weights)
+
+            # Gradiente de resíduos recente ponderado
+            h_m = np.sum(residuals * time_weights[:, None], axis=0)
+            h_norm = _min_max_scale(h_m)
+
+            # 3. Atualização do ensemble com regularização por encolhimento (Shrinkage, Géron p. 205)
+            # F_{m} = F_{m-1} + learning_rate * (h_norm - 0.5)
+            F_current = F_current + self.learning_rate * (h_norm - 0.5)
+            F_current = np.clip(F_current, 0.0, None)
+
+            # 4. Atualização dos resíduos para a próxima etapa
+            residuals = residuals - self.learning_rate * (h_norm[None, :] - 0.5)
+            self.staged_scores_.append(_min_max_scale(F_current).copy())
+
+        final_scores = _min_max_scale(F_current)
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_gradboost': np.round(final_scores, 5),
+            'escore_acumulado': np.round(F_current, 5)
+        }).sort_values('escore_gradboost', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo Gradient Boosting.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted(self.scores_df_.head(k)['dezena'].tolist())
+
+    def staged_predict_top_k(self, k: Optional[int] = None) -> Generator[List[int], None, None]:
+        """
+        Iterador sobre as predições do ensemble em cada estágio de treinamento (Géron p. 206).
+        """
+        if not self.staged_scores_:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        k = k if k is not None else (len(self.top_k_) if self.top_k_ is not None else 6)
+        for s in self.staged_scores_:
+            if k <= 0:
+                yield []
+            else:
+                k_actual = min(k, len(s))
+                yield sorted(list(np.argsort(s)[::-1][:k_actual] + 1))
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do Gradient Boosting."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+class LotteryStackingModel:
+    """
+    Ensemble Stacking (Stacked Generalization / Blending) para Seleção de Dezenas em Loterias.
+    Baseado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 7:
+    'Stacking' (David H. Wolpert, 1992, 'Stacked Generalization', Neural Networks).
+
+    Fundamentação Teórica e Algorítmica:
+    1. Estrutura em Camadas (Layered Architecture, Géron p. 208-210):
+       - Camada 1 (Base Predictors): Preditores de paradigmas estatísticos e analíticos distintos:
+         M1 (Estatístico/Momentum/Overdue), M2 (Regressão Logística L2), M3 (Bayesiano Conjugado/Adaptativo)
+         e M4 (Template Gianella).
+       - Camada 2 (Blender / Meta-Learner): Um modelo supervisionado treinado sobre as predições
+         geradas pelos estimadores da Camada 1 em partição holdout (ou out-of-fold).
+    2. Treinamento do Meta-Learner (Blending, Géron Figura 7-13 e 7-14):
+       - A base histórica D é dividida temporalmente em D_train e D_blend (holdout).
+       - Os estimadores da Camada 1 são ajustados em D_train e produzem matriz de escores de dezenas.
+       - A matriz de meta-features X_meta (shape n_dezenas x n_modelos) é associada ao vetor target y_meta
+         (frequência empírica observada no conjunto holdout D_blend).
+       - O meta-learner (Ridge regularizado L2) aprende os coeficientes ótimos beta_1, ..., beta_M
+         para ponderar os modelos base com regularização que evita sobreajuste.
+    3. Inferência para o Concurso N+1 (Géron Figura 7-15):
+       - Os modelos da Camada 1 geram as pontuações na base completa até N.
+       - As pontuações passam pelo meta-learner calibrado para produzir o escore final de stacking.
+    """
+
+    def __init__(self,
+                 holdout_ratio: float = 0.25,
+                 meta_learner: str = 'ridge',
+                 alpha: float = 1.0,
+                 random_state: int = 42,
+                 base_models: Optional[List[str]] = None):
+        """
+        Parameters
+        ----------
+        holdout_ratio : float
+            Fração dos concursos mais recentes reservados para treinar o blender (default 0.25).
+        meta_learner : str
+            Algoritmo meta-aprendiz ('ridge' ou 'linear').
+        alpha : float
+            Parâmetro de regularização L2 para o meta-aprendiz Ridge (default 1.0).
+        random_state : int
+            Semente para reprodutibilidade.
+        base_models : Optional[List[str]]
+            Modelos de base a integrar na Camada 1.
+        """
+        if not (0.05 <= holdout_ratio <= 0.50):
+            raise ValueError(f"holdout_ratio deve estar entre 0.05 e 0.50. Recebido: {holdout_ratio}")
+        if meta_learner not in ('ridge', 'linear'):
+            raise ValueError(f"meta_learner deve ser 'ridge' ou 'linear'. Recebido: {meta_learner}")
+
+        self.holdout_ratio = holdout_ratio
+        self.meta_learner = meta_learner
+        self.alpha = alpha
+        self.random_state = random_state
+        self.base_models = base_models or [
+            'm1_balanced', 'm1_momentum', 'm1_overdue',
+            'm2_logistic', 'm3_global', 'm3_adaptive', 'm4_gianella'
+        ]
+
+        self.blender_ = None
+        self.blender_weights_: Dict[str, float] = {}
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryStackingModel':
+        """
+        Ajusta os estimadores da Camada 1 e treina o Blender / Meta-Learner da Camada 2.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+
+        # 1. Divisão em Treino de Base e Holdout para o Blender (Géron p. 209)
+        n_blend = max(10, int(self.holdout_ratio * n_concursos))
+        split_idx = max(10, n_concursos - n_blend)
+
+        X_train_base = binary_matrix[:split_idx]
+        X_holdout = binary_matrix[split_idx:]
+
+        # 2. Camada 1: Extrai escores dos modelos base ajustados em X_train_base
+        n_base = len(self.base_models)
+        X_meta = np.zeros((n_dezenas, n_base), dtype=float)
+        for j, m_name in enumerate(self.base_models):
+            X_meta[:, j] = _extract_base_model_scores(m_name, X_train_base, cfg, seed=self.random_state + j)
+
+        # Target do blender: frequência empírica normalizada das dezenas no período holdout
+        y_meta = X_holdout.sum(axis=0).astype(float) / float(len(X_holdout))
+        y_meta_norm = _min_max_scale(y_meta)
+
+        # 3. Camada 2: Treinamento do Blender / Meta-Learner (Géron Eq. Stacking p. 209-210)
+        from sklearn.linear_model import Ridge, LinearRegression
+        if self.meta_learner == 'ridge':
+            blender = Ridge(alpha=self.alpha, fit_intercept=True, random_state=self.random_state)
+        else:
+            blender = LinearRegression(fit_intercept=True)
+
+        blender.fit(X_meta, y_meta_norm)
+        self.blender_ = blender
+
+        coefs = blender.coef_
+        self.blender_weights_ = {
+            m_name: float(np.round(coefs[j], 4)) for j, m_name in enumerate(self.base_models)
+        }
+
+        # 4. Inferência para o concurso alvo (N+1): escores dos modelos base na base total
+        X_meta_full = np.zeros((n_dezenas, n_base), dtype=float)
+        for j, m_name in enumerate(self.base_models):
+            X_meta_full[:, j] = _extract_base_model_scores(m_name, binary_matrix, cfg, seed=self.random_state + j)
+
+        # O Blender gera as predições combinadas
+        raw_stacking_scores = blender.predict(X_meta_full)
+        final_scores = _min_max_scale(raw_stacking_scores)
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        res_dict = {
+            'dezena': dezenas,
+            'escore_stacking': np.round(final_scores, 5),
+            'meta_pred_bruto': np.round(raw_stacking_scores, 5)
+        }
+        for j, m_name in enumerate(self.base_models):
+            res_dict[f'base_{m_name}'] = np.round(X_meta_full[:, j], 4)
+
+        self.scores_df_ = pd.DataFrame(res_dict).sort_values('escore_stacking', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo ensemble Stacking.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted(self.scores_df_.head(k)['dezena'].tolist())
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do Stacking."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+
+def predict_bagging(binary_matrix: np.ndarray,
+                    cfg: Dict,
+                    k: Optional[int] = None,
+                    n_estimators: int = 10,
+                    random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Bagging."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryBaggingModel(n_estimators=n_estimators, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+def predict_adaboost(binary_matrix: np.ndarray,
+                     cfg: Dict,
+                     k: Optional[int] = None,
+                     n_estimators: int = 10,
+                     learning_rate: float = 1.0,
+                     random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble AdaBoost."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryAdaBoostModel(n_estimators=n_estimators, learning_rate=learning_rate, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+def predict_gradient_boosting(binary_matrix: np.ndarray,
+                              cfg: Dict,
+                              k: Optional[int] = None,
+                              n_estimators: int = 10,
+                              learning_rate: float = 0.5,
+                              random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Gradient Boosting."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryGradientBoostingModel(n_estimators=n_estimators, learning_rate=learning_rate, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+
+
+def predict_pasting(binary_matrix: np.ndarray,
+                    cfg: Dict,
+                    k: Optional[int] = None,
+                    n_estimators: int = 10,
+                    max_samples: float = 0.8,
+                    voting: str = 'soft',
+                    random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Pasting."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryPastingModel(n_estimators=n_estimators, max_samples=max_samples,
+                                voting=voting, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+def predict_stacking(binary_matrix: np.ndarray,
+                     cfg: Dict,
+                     k: Optional[int] = None,
+                     holdout_ratio: float = 0.25,
+                     meta_learner: str = 'ridge',
+                     alpha: float = 1.0,
+                     random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Stacking."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryStackingModel(holdout_ratio=holdout_ratio, meta_learner=meta_learner,
+                                 alpha=alpha, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+# ==============================================================================
 # 4. FUNÇÃO COMPARATIVA E RELATÓRIO EXECUTIVO
 # ==============================================================================
 
 def run_all_methods(filepath: str,
                     next_concurso: Optional[int] = None,
-                    include_hybrids: bool = False) -> Dict[str, object]:
+                    include_hybrids: bool = False,
+                    include_ensembles: Optional[bool] = None) -> Dict[str, object]:
     """
     Executa os métodos sobre a base histórica e consolida os resultados
     para o próximo concurso especificado (ou inferido automaticamente).
     """
-    return run_all_lottery_methods(filepath, game='megasena', next_concurso=next_concurso, include_hybrids=include_hybrids)
+    return run_all_lottery_methods(filepath, game='megasena', next_concurso=next_concurso,
+                                   include_hybrids=include_hybrids, include_ensembles=include_ensembles)
 
 
 def run_all_lottery_methods(filepath: str,
                             game: str = 'auto',
                             next_concurso: Optional[int] = None,
-                            include_hybrids: bool = False) -> Dict:
+                            include_hybrids: bool = False,
+                            include_ensembles: Optional[bool] = None) -> Dict:
     """
     Executa os métodos analíticos para qualquer loteria (Mega-Sena, Lotofácil, Quina).
     """
+    if include_ensembles is None:
+        include_ensembles = include_hybrids
+
     df, binary_matrix, cfg = load_lottery_data(filepath, game=game)
     if next_concurso is None:
         next_concurso = int(df['Concurso'].max()) + 1
@@ -1986,6 +2860,35 @@ def run_all_lottery_methods(filepath: str,
         'Bayes Adaptativo + Frequência/Atraso (Balanceado)': pred_ba_bal
     }
 
+        # 6. Métodos Ensemble (Géron, Cap. 7: Bagging, Pasting, AdaBoost, Gradient Boosting, Stacking)
+    m_bagging = LotteryBaggingModel(n_estimators=10, random_state=42)
+    m_bagging.fit(binary_matrix, cfg=cfg)
+    pred_bagging = m_bagging.predict_top_k(k)
+
+    m_pasting = LotteryPastingModel(n_estimators=10, max_samples=0.8, random_state=42)
+    m_pasting.fit(binary_matrix, cfg=cfg)
+    pred_pasting = m_pasting.predict_top_k(k)
+
+    m_adaboost = LotteryAdaBoostModel(n_estimators=10, learning_rate=1.0, random_state=42)
+    m_adaboost.fit(binary_matrix, cfg=cfg)
+    pred_adaboost = m_adaboost.predict_top_k(k)
+
+    m_gradboost = LotteryGradientBoostingModel(n_estimators=10, learning_rate=0.5, random_state=42)
+    m_gradboost.fit(binary_matrix, cfg=cfg)
+    pred_gradboost = m_gradboost.predict_top_k(k)
+
+    m_stacking = LotteryStackingModel(holdout_ratio=0.25, random_state=42)
+    m_stacking.fit(binary_matrix, cfg=cfg)
+    pred_stacking = m_stacking.predict_top_k(k)
+
+    predictions_ensemble = {
+        'Ensemble Bagging': pred_bagging,
+        'Ensemble Pasting': pred_pasting,
+        'Ensemble AdaBoost': pred_adaboost,
+        'Ensemble Gradient Boosting': pred_gradboost,
+        'Ensemble Stacking': pred_stacking
+    }
+
     predictions = {
         'Metodo 1 (Estatistico - Balanceado)': pred_m1,
         'Metodo 1 (Sub-estrategia Mais Atrasadas)': pred_m1_overdue,
@@ -2014,6 +2917,13 @@ def run_all_lottery_methods(filepath: str,
         predictions['Metodo 18 (Bayes Adaptativo + Frequencia/Atraso Momentum)'] = pred_ba_mom
         predictions['Metodo 19 (Bayes Adaptativo + Frequencia/Atraso Balanceado)'] = pred_ba_bal
 
+    if include_ensembles:
+        predictions['Metodo 20 (Ensemble Bagging - Bootstrap Aggregating)'] = pred_bagging
+        predictions['Metodo 21 (Ensemble Pasting - Non-replacement Aggregating)'] = pred_pasting
+        predictions['Metodo 22 (Ensemble AdaBoost - Adaptive Boosting)'] = pred_adaboost
+        predictions['Metodo 23 (Ensemble Gradient Boosting - Residual Boosting)'] = pred_gradboost
+        predictions['Metodo 24 (Ensemble Stacking - Stacked Generalization)'] = pred_stacking
+
     comparison_records = []
     for name, nums in predictions.items():
         comparison_records.append({
@@ -2034,10 +2944,16 @@ def run_all_lottery_methods(filepath: str,
         'm3_dyn': m3_dyn,
         'm4_gianella': m4,
         'm_hybrid': m_hybrid,
+        'm_bagging': m_bagging,
+        'm_pasting': m_pasting,
+        'm_adaboost': m_adaboost,
+        'm_gradboost': m_gradboost,
+        'm_stacking': m_stacking,
         'pred_consenso': pred_consenso,
         'consensus_scores': ball_scores,
         'predictions': predictions,
         'predictions_hybrid': predictions_hybrid,
+        'predictions_ensemble': predictions_ensemble,
         'comparison_df': comparison_df
     }
 

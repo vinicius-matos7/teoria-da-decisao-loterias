@@ -489,6 +489,41 @@ class TestEdgeCasesAndRobustness:
         fig = monitor.plot_dashboard(save_path=None, show=False)
         assert fig is not None
 
+    def test_ensemble_models_in_walk_forward(self):
+        """Verifica que os modelos Ensemble (Bagging, AdaBoost, Gradient Boosting) rodam perfeitamente no walk-forward."""
+        np.random.seed(42)
+        n_concursos = 115
+        n_dezenas = 60
+        k = 6
+
+        matrix = np.zeros((n_concursos, n_dezenas), dtype=int)
+        for i in range(n_concursos):
+            draw = np.random.choice(n_dezenas, size=k, replace=False)
+            matrix[i, draw] = 1
+
+        df = pd.DataFrame({'Concurso': np.arange(1, n_concursos + 1)})
+        for col_idx in range(k):
+            df[f'bola {col_idx + 1}'] = 0
+        for i in range(n_concursos):
+            drawn = np.where(matrix[i] == 1)[0] + 1
+            for col_idx, num in enumerate(drawn):
+                df.at[i, f'bola {col_idx + 1}'] = num
+
+        monitor = LotteryBacktestMonitor(game='megasena')
+        monitor.df = df
+        monitor.binary_matrix = matrix
+        monitor.n_concursos = n_concursos
+
+        ensemble_models = ['Ensemble Bagging', 'Ensemble Pasting', 'Ensemble AdaBoost', 'Ensemble Gradient Boosting', 'Ensemble Stacking']
+        monitor.run_walk_forward(n_contests=2, models_to_run=ensemble_models, verbose=False)
+
+        assert len(monitor.raw_results_df) == 2 * len(ensemble_models)
+        for m_name in ensemble_models:
+            sub = monitor.raw_results_df[monitor.raw_results_df['model'] == m_name]
+            assert len(sub) == 2
+            assert all(len(d) == 6 for d in sub['dezenas'])
+            assert all(len(set(d)) == 6 for d in sub['dezenas'])
+
     def test_insufficient_history_raises_error(self):
         """Verifica que ultrapassar o histórico com concursos insuficientes de warmup aciona ValueError com mensagem clara."""
         monitor = LotteryBacktestMonitor(game='megasena')
