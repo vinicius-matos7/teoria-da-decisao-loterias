@@ -94,10 +94,26 @@ Cada notebook executa e compara **4 abordagens metodológicas**:
    * Modelagem combinatória baseada nas cores e gabaritos diofantinos de partição de inteiros.
    * Restrição do espaço de busca para as partições de maior probabilidade teórica.
 
-5. **Métodos Híbridos (Gianella & Teoria da Decisão Bayesiana):**
-   * **Gianella com Bayes Global:** Aloca as cotas diofantinas do gabarito combinatório de Gianella selecionando as dezenas que maximizam a esperança a posteriori conjugada global $\mathbb{E}[\theta_i \mid \text{dados}]$.
-   * **Gianella com Bayes Adaptativo:** Aplica o gabarito ótimo sobre as probabilidades a posteriori do modelo Bayesiano dinâmico com ponderação temporal exponencial ($\tau = 150$).
-   * **Gianella com a Melhor Decisão de Bayes:** Maximiza a utilidade esperada a posteriori sob a restrição combinatória do macro-estado mais provável: $\max_{a \in \mathcal{T}^*} \mathbb{E}[U(a, s) \mid \text{dados}]$, integrando o consenso bayesiano e minimização de risco/covariância.
+5. **Métodos Híbridos (Grade Combinatória Completa — 15 Métodos):**
+   * **Família Gianella (Geometria do Acaso & Gabaritos Diofantinos de Cores):**
+     * **Gianella + Bayes Global:** Aloca as cotas diofantinas do gabarito combinatório de Gianella selecionando as dezenas que maximizam a esperança a posteriori conjugada global $\mathbb{E}[\theta_i \mid \text{dados}]$.
+     * **Gianella + Bayes Adaptativo:** Aplica o gabarito ótimo sobre as probabilidades a posteriori do modelo Bayesiano dinâmico com ponderação temporal exponencial ($\tau = 150$).
+     * **Gianella + Melhor Decisão de Bayes:** Maximiza a utilidade esperada a posteriori sob a restrição combinatória do macro-estado mais provável: $\max_{a \in \mathcal{T}^*} \mathbb{E}[U(a, s) \mid \text{dados}]$, integrando o consenso bayesiano e minimização de risco/covariância.
+     * **Gianella + Regressão Logística:** Preenche o gabarito diofantino selecionando as dezenas com maiores probabilidades calibradas pelo classificador supervisionado de Machine Learning.
+     * **Gianella + Freq/Atraso (Momentum):** Preenche o gabarito de cores priorizando as dezenas de maior intensidade de frequência ponderada recente.
+     * **Gianella + Freq/Atraso (Balanceado):** Preenche o gabarito de cores combinando o momentum recente com a pressão de atraso relativo via escore padronizado.
+   * **Família Melhor Decisão de Bayes (Consenso e Teoria da Decisão sob Incerteza):**
+     * **Melhor Decisão de Bayes + Regressão Logística:** *Linear Opinion Pool* combinando 50% utilidade bayesiana de consenso com 50% probabilidades calibradas de ML.
+     * **Melhor Decisão de Bayes + Freq/Atraso (Momentum):** Combinação linear do consenso ótimo de Bayes com a frequência recente ponderada.
+     * **Melhor Decisão de Bayes + Freq/Atraso (Balanceado):** Integração do consenso decisório ótimo com o escore composto balanceado de frequência e atraso.
+   * **Família Bayes Global (Conjugada Beta-Binomial Estática):**
+     * **Bayes Global + Regressão Logística:** Combinação convexa da posteriori Beta-Binomial global com probabilidades preditivas de ML.
+     * **Bayes Global + Frequência/Atraso (Momentum):** Ponderação da probabilidade a posteriori estática com o momentum temporal.
+     * **Bayes Global + Frequência/Atraso (Balanceado):** Combinação da posteriori global com a métrica padronizada de frequência e atraso.
+   * **Família Bayes Adaptativo (Decaimento Temporal Exponencial):**
+     * **Bayes Adaptativo + Regressão Logística:** Combinação da evidência temporal a posteriori com probabilidades de ML supervisionado.
+     * **Bayes Adaptativo + Frequência/Atraso (Momentum):** Fusão da posteriori adaptativa dinâmica com a taxa recente de sorteios.
+     * **Bayes Adaptativo + Frequência/Atraso (Balanceado):** Combinação da evidência bayesiana dinâmica com o equilíbrio entre frequência e atraso.
 
 ---
 

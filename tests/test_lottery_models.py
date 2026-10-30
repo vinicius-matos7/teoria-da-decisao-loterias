@@ -18,9 +18,22 @@ from mega_sena_models import (
     BayesianDecisionModel,
     GianellaColorTemplateModel,
     GianellaBayesHybridModel,
+    BayesianHybridModel,
     predict_gianella_bayes_global,
     predict_gianella_bayes_adaptive,
     predict_gianella_best_bayes_decision,
+    predict_gianella_logistic_regression,
+    predict_gianella_momentum,
+    predict_gianella_balanced,
+    predict_best_bayes_logistic_regression,
+    predict_best_bayes_momentum,
+    predict_best_bayes_balanced,
+    predict_bayes_global_logistic_regression,
+    predict_bayes_global_momentum,
+    predict_bayes_global_balanced,
+    predict_bayes_adaptive_logistic_regression,
+    predict_bayes_adaptive_momentum,
+    predict_bayes_adaptive_balanced,
     run_all_lottery_methods
 )
 
@@ -121,12 +134,31 @@ class TestModelsExecution:
             n_dezenas=60, k=6, group_size=10, alpha_0=1.0, beta_0=9.0, decay_half_life=50.0
         ).fit(synthetic_data)
 
-        # 1. Teste das três estratégias
+        # 1. Teste de todas as estratégias híbridas no GianellaBayesHybridModel
         top_global = m_hybrid.predict_gianella_bayes_global(6)
         top_adapt = m_hybrid.predict_gianella_bayes_adaptive(6)
         top_best = m_hybrid.predict_gianella_best_bayes_decision(6)
+        top_g_lr = m_hybrid.predict_gianella_logistic_regression(6)
+        top_g_mom = m_hybrid.predict_gianella_momentum(6)
+        top_g_bal = m_hybrid.predict_gianella_balanced(6)
+        top_bb_lr = m_hybrid.predict_best_bayes_logistic_regression(6)
+        top_bb_mom = m_hybrid.predict_best_bayes_momentum(6)
+        top_bb_bal = m_hybrid.predict_best_bayes_balanced(6)
+        top_bg_lr = m_hybrid.predict_bayes_global_logistic_regression(6)
+        top_bg_mom = m_hybrid.predict_bayes_global_momentum(6)
+        top_bg_bal = m_hybrid.predict_bayes_global_balanced(6)
+        top_ba_lr = m_hybrid.predict_bayes_adaptive_logistic_regression(6)
+        top_ba_mom = m_hybrid.predict_bayes_adaptive_momentum(6)
+        top_ba_bal = m_hybrid.predict_bayes_adaptive_balanced(6)
 
-        for name, bet in [('global', top_global), ('adaptive', top_adapt), ('best_bayes', top_best)]:
+        all_hybrid_bets = [
+            ('g_global', top_global), ('g_adapt', top_adapt), ('g_best', top_best),
+            ('g_lr', top_g_lr), ('g_mom', top_g_mom), ('g_bal', top_g_bal),
+            ('bb_lr', top_bb_lr), ('bb_mom', top_bb_mom), ('bb_bal', top_bb_bal),
+            ('bg_lr', top_bg_lr), ('bg_mom', top_bg_mom), ('bg_bal', top_bg_bal),
+            ('ba_lr', top_ba_lr), ('ba_mom', top_ba_mom), ('ba_bal', top_ba_bal)
+        ]
+        for name, bet in all_hybrid_bets:
             assert len(bet) == 6, f"Tamanho incorreto para {name}"
             assert len(set(bet)) == 6, f"Dezenas duplicadas em {name}"
             assert all(1 <= d <= 60 for d in bet), f"Dezenas fora do intervalo em {name}"
@@ -135,6 +167,9 @@ class TestModelsExecution:
         assert m_hybrid.predict_top_k(6, strategy='bayes_global') == top_global
         assert m_hybrid.predict_top_k(6, strategy='bayes_adaptive') == top_adapt
         assert m_hybrid.predict_top_k(6, strategy='bayes_decision') == top_best
+        assert m_hybrid.predict_top_k(6, strategy='logistic_regression') == top_g_lr
+        assert m_hybrid.predict_top_k(6, strategy='momentum') == top_g_mom
+        assert m_hybrid.predict_top_k(6, strategy='balanced') == top_g_bal
 
         # 3. Teste com escores de consenso externos
         consensus = np.random.uniform(0.1, 5.0, size=60)
@@ -203,6 +238,30 @@ class TestModelsExecution:
         assert 'prob_bayes_global' in summary_df.columns
         assert 'prob_bayes_adaptativo' in summary_df.columns
         assert 'escore_melhor_decisao' in summary_df.columns
+
+    def test_bayesian_hybrid_model(self, synthetic_data):
+        m_bayes_hyb = BayesianHybridModel(
+            n_dezenas=60, k=6, alpha_0=1.0, beta_0=9.0, decay_half_life=50.0
+        ).fit(synthetic_data)
+
+        bb_lr = m_bayes_hyb.predict_best_bayes_logistic_regression(6)
+        bb_mom = m_bayes_hyb.predict_best_bayes_momentum(6)
+        bb_bal = m_bayes_hyb.predict_best_bayes_balanced(6)
+        bg_lr = m_bayes_hyb.predict_bayes_global_logistic_regression(6)
+        bg_mom = m_bayes_hyb.predict_bayes_global_momentum(6)
+        bg_bal = m_bayes_hyb.predict_bayes_global_balanced(6)
+        ba_lr = m_bayes_hyb.predict_bayes_adaptive_logistic_regression(6)
+        ba_mom = m_bayes_hyb.predict_bayes_adaptive_momentum(6)
+        ba_bal = m_bayes_hyb.predict_bayes_adaptive_balanced(6)
+
+        for name, bet in [
+            ('bb_lr', bb_lr), ('bb_mom', bb_mom), ('bb_bal', bb_bal),
+            ('bg_lr', bg_lr), ('bg_mom', bg_mom), ('bg_bal', bg_bal),
+            ('ba_lr', ba_lr), ('ba_mom', ba_mom), ('ba_bal', ba_bal)
+        ]:
+            assert len(bet) == 6, f"Tamanho incorreto para {name}"
+            assert len(set(bet)) == 6, f"Dezenas duplicadas em {name}"
+            assert all(1 <= d <= 60 for d in bet), f"Dezenas fora da faixa em {name}"
 
 
 class TestNotebooksIntegrity:
@@ -275,9 +334,9 @@ class TestRunAllLotteryMethods:
         for k in required_keys:
             assert k in results, f"Chave {k} ausente em results"
 
-        assert len(results['predictions']) == 11
-        assert len(results['comparison_df']) == 11
-        assert len(results['predictions_hybrid']) == 3
+        assert len(results['predictions']) == 23
+        assert len(results['comparison_df']) == 23
+        assert len(results['predictions_hybrid']) == 15
 
         for name, bet in results['predictions'].items():
             assert len(bet) == expected_k, f"Tamanho incorreto para {name}: {len(bet)} != {expected_k}"

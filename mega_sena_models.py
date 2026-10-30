@@ -1041,10 +1041,52 @@ class GianellaColorTemplateModel:
 # Renato Gianella (2013) + Esteves, Izbicki e Stern (2020)
 # ==============================================================================
 
+def _min_max_scale(arr: np.ndarray) -> np.ndarray:
+    """Normaliza um vetor para [0, 1]. Se amplitude for zero, retorna array de zeros."""
+    arr = np.asarray(arr, dtype=float)
+    mn = np.min(arr)
+    mx = np.max(arr)
+    if mx - mn > 1e-12:
+        return (arr - mn) / (mx - mn)
+    return np.zeros_like(arr)
+
+
+def _select_top_k_greedy(scores: np.ndarray,
+                         k: int,
+                         cov_matrix: Optional[np.ndarray] = None,
+                         risk_penalty: float = 0.0) -> List[int]:
+    """Seleciona as top K dezenas com penalização de covariância e aversão ao risco."""
+    n = len(scores)
+    k = max(0, min(k, n))
+    if k == 0:
+        return []
+    if risk_penalty <= 0.0 or cov_matrix is None:
+        return sorted(list(np.argsort(scores)[::-1][:k] + 1))
+
+    candidates = list(range(n))
+    selected: List[int] = []
+    while len(selected) < k and candidates:
+        best_gain = -np.inf
+        best_c = None
+        for cand in candidates:
+            cov_pen = risk_penalty * sum(cov_matrix[cand, s] for s in selected)
+            gain = scores[cand] - cov_pen
+            if gain > best_gain:
+                best_gain = gain
+                best_c = cand
+        if best_c is not None:
+            selected.append(best_c)
+            candidates.remove(best_c)
+        else:
+            break
+    return sorted([s + 1 for s in selected])
+
+
 class GianellaBayesHybridModel:
     """
     Método Híbrido: A Geometria do Acaso (Gianella, 2013) combinada com
-    Inferência Bayesiana e Teoria da Decisão (Esteves, Izbicki e Stern).
+    Inferência Bayesiana e Teoria da Decisão (Esteves, Izbicki e Stern),
+    Regressão Logística Calibrada e Modelagem Temporal de Frequência/Atraso.
 
     Fundamentação Teórica:
     1. Macro-Estrutura (Combinatória de Gianella):
@@ -1119,12 +1161,21 @@ class GianellaBayesHybridModel:
         self.post_probs_global_: Optional[np.ndarray] = None
         self.post_probs_adaptive_: Optional[np.ndarray] = None
         self.bayes_decision_scores_: Optional[np.ndarray] = None
+        self.ml_scores_: Optional[np.ndarray] = None
+        self.momentum_scores_: Optional[np.ndarray] = None
+        self.balanced_scores_: Optional[np.ndarray] = None
         self.top_template_: Optional[Tuple[int, ...]] = None
         self.summary_df_: Optional[pd.DataFrame] = None
 
-    def fit(self, binary_matrix: np.ndarray, consensus_scores: Optional[np.ndarray] = None) -> 'GianellaBayesHybridModel':
+    def fit(self,
+            binary_matrix: np.ndarray,
+            consensus_scores: Optional[np.ndarray] = None,
+            ml_scores: Optional[np.ndarray] = None,
+            momentum_scores: Optional[np.ndarray] = None,
+            balanced_scores: Optional[np.ndarray] = None) -> 'GianellaBayesHybridModel':
         """
-        Ajusta os gabaritos de Gianella e os modelos Bayesianos (Global, Adaptativo e Decisão Ótima).
+        Ajusta os gabaritos de Gianella e os modelos Bayesianos (Global, Adaptativo e Decisão Ótima)
+        e integra os escores auxiliares (Regressão Logística, Momentum e Balanceado).
         """
         if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] < 1:
             raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
@@ -1171,6 +1222,48 @@ class GianellaBayesHybridModel:
             # Equilíbrio bayesiano entre evidência estática global e dinâmica adaptativa
             self.bayes_decision_scores_ = 0.5 * self.post_probs_global_ + 0.5 * self.post_probs_adaptive_
 
+        # 6. Escores Auxiliares: Momentum e Balanceado
+        m1_needed = (momentum_scores is None or len(momentum_scores) != self.n_dezenas or
+                     balanced_scores is None or len(balanced_scores) != self.n_dezenas)
+        if m1_needed:
+            m1_model = FrequencyDelayModel(half_life=100.0, alpha=0.5)
+            m1_model.fit(binary_matrix)
+
+        if momentum_scores is not None and len(momentum_scores) == self.n_dezenas:
+            self.momentum_scores_ = _min_max_scale(momentum_scores)
+        else:
+            mom = np.zeros(self.n_dezenas, dtype=float)
+            for _, r in m1_model.scores_df_.iterrows():
+                mom[int(r['dezena']) - 1] = float(r['freq_ponderada'])
+            self.momentum_scores_ = _min_max_scale(mom)
+
+        if balanced_scores is not None and len(balanced_scores) == self.n_dezenas:
+            self.balanced_scores_ = _min_max_scale(balanced_scores)
+        else:
+            bal = np.zeros(self.n_dezenas, dtype=float)
+            for _, r in m1_model.scores_df_.iterrows():
+                bal[int(r['dezena']) - 1] = float(r['escore_composto'])
+            self.balanced_scores_ = _min_max_scale(bal)
+
+        # 7. Escores Auxiliares: Regressão Logística
+        if ml_scores is not None and len(ml_scores) == self.n_dezenas:
+            self.ml_scores_ = _min_max_scale(ml_scores)
+        else:
+            if n_concursos > 30:
+                try:
+                    min_hist = min(100, max(20, n_concursos // 2))
+                    m2_model = MultiLabelMLModel(estimator='logistic_regression', min_train_history=min_hist, random_state=42)
+                    m2_model.fit(binary_matrix)
+                    df_probs = m2_model.get_probabilities_df()
+                    ml_arr = np.zeros(self.n_dezenas, dtype=float)
+                    for _, r in df_probs.iterrows():
+                        ml_arr[int(r['dezena']) - 1] = float(r['probabilidade_calibrada_sorteio'])
+                    self.ml_scores_ = _min_max_scale(ml_arr)
+                except Exception:
+                    self.ml_scores_ = self.momentum_scores_.copy()
+            else:
+                self.ml_scores_ = self.momentum_scores_.copy()
+
         # Constrói DataFrame comparativo
         dezenas = np.arange(1, self.n_dezenas + 1)
         cores = [int(i // self.group_size) for i in range(self.n_dezenas)]
@@ -1179,7 +1272,10 @@ class GianellaBayesHybridModel:
             'grupo_cor': cores,
             'prob_bayes_global': np.round(self.post_probs_global_, 5),
             'prob_bayes_adaptativo': np.round(self.post_probs_adaptive_, 5),
-            'escore_melhor_decisao': np.round(self.bayes_decision_scores_, 5)
+            'escore_melhor_decisao': np.round(self.bayes_decision_scores_, 5),
+            'escore_ml_logistica': np.round(self.ml_scores_, 5),
+            'escore_momentum': np.round(self.momentum_scores_, 5),
+            'escore_balanceado': np.round(self.balanced_scores_, 5),
         })
 
         return self
@@ -1266,16 +1362,19 @@ class GianellaBayesHybridModel:
                       strategy: str = 'bayes_decision',
                       template: Optional[Tuple[int, ...]] = None) -> List[int]:
         """
-        Retorna as K dezenas selecionadas pela união de Gianella com a estratégia Bayesiana indicada.
+        Retorna as K dezenas selecionadas pela união de Gianella com a estratégia indicada.
 
         Parameters
         ----------
         k : Optional[int]
             Quantidade de dezenas a selecionar (default self.k).
         strategy : str
-            - 'bayes_decision' ou 'bayes_optimal': Gianella com a Melhor Decisão de Bayes.
+            - 'bayes_decision' / 'bayes_optimal': Gianella com a Melhor Decisão de Bayes.
             - 'bayes_global': Gianella com Bayes Global.
             - 'bayes_adaptive': Gianella com Bayes Adaptativo.
+            - 'logistic_regression' / 'ml': Gianella com Regressão Logística.
+            - 'momentum': Gianella com Frequência/Atraso (Momentum).
+            - 'balanced': Gianella com Frequência/Atraso (Balanceado).
         template : Optional[Tuple[int, ...]]
             Gabarito de cores diofantino a seguir (default: top_template_).
         """
@@ -1291,10 +1390,17 @@ class GianellaBayesHybridModel:
             scores = self.post_probs_adaptive_
         elif strat in ['bayes_decision', 'bayes_optimal', 'optimal', 'melhor_decisao', 'decisao']:
             scores = self.bayes_decision_scores_
+        elif strat in ['logistic_regression', 'regressao_logistica', 'ml', 'gianella_logistic_regression']:
+            scores = self.ml_scores_
+        elif strat in ['momentum', 'momento', 'gianella_momentum']:
+            scores = self.momentum_scores_
+        elif strat in ['balanced', 'balanceado', 'gianella_balanced']:
+            scores = self.balanced_scores_
         else:
             raise ValueError(
                 f"Estratégia desconhecida: '{strategy}'. "
-                f"Opções válidas: 'bayes_decision', 'bayes_global', 'bayes_adaptive'."
+                f"Opções válidas: 'bayes_decision', 'bayes_global', 'bayes_adaptive', "
+                f"'logistic_regression', 'momentum', 'balanced'."
             )
 
         return self._select_under_template(scores, k=k, template=template)
@@ -1310,6 +1416,63 @@ class GianellaBayesHybridModel:
     def predict_gianella_best_bayes_decision(self, k: Optional[int] = None) -> List[int]:
         """Predição unindo Gianella com a Melhor Decisão de Bayes."""
         return self.predict_top_k(k=k, strategy='bayes_decision')
+
+    def predict_gianella_logistic_regression(self, k: Optional[int] = None) -> List[int]:
+        """Predição unindo Gianella com Regressão Logística Calibrada."""
+        return self.predict_top_k(k=k, strategy='logistic_regression')
+
+    def predict_gianella_momentum(self, k: Optional[int] = None) -> List[int]:
+        """Predição unindo Gianella com Frequência/Atraso (Momentum)."""
+        return self.predict_top_k(k=k, strategy='momentum')
+
+    def predict_gianella_balanced(self, k: Optional[int] = None) -> List[int]:
+        """Predição unindo Gianella com Frequência/Atraso (Balanceado)."""
+        return self.predict_top_k(k=k, strategy='balanced')
+
+    def _combine_and_select(self, base_scores: np.ndarray, aux_scores: np.ndarray, k: Optional[int] = None) -> List[int]:
+        if k is None:
+            k = self.k
+        comb = 0.5 * _min_max_scale(base_scores) + 0.5 * _min_max_scale(aux_scores)
+        return _select_top_k_greedy(comb, k=k, cov_matrix=self.cov_matrix_, risk_penalty=self.risk_penalty)
+
+    # 1. Melhor Decisão de Bayes + Auxiliares
+    def predict_best_bayes_logistic_regression(self, k: Optional[int] = None) -> List[int]:
+        """Melhor Decisão de Bayes + Regressão Logística."""
+        return self._combine_and_select(self.bayes_decision_scores_, self.ml_scores_, k=k)
+
+    def predict_best_bayes_momentum(self, k: Optional[int] = None) -> List[int]:
+        """Melhor Decisão de Bayes + Frequência/Atraso (Momentum)."""
+        return self._combine_and_select(self.bayes_decision_scores_, self.momentum_scores_, k=k)
+
+    def predict_best_bayes_balanced(self, k: Optional[int] = None) -> List[int]:
+        """Melhor Decisão de Bayes + Frequência/Atraso (Balanceado)."""
+        return self._combine_and_select(self.bayes_decision_scores_, self.balanced_scores_, k=k)
+
+    # 2. Bayes Global + Auxiliares
+    def predict_bayes_global_logistic_regression(self, k: Optional[int] = None) -> List[int]:
+        """Bayes Global + Regressão Logística."""
+        return self._combine_and_select(self.post_probs_global_, self.ml_scores_, k=k)
+
+    def predict_bayes_global_momentum(self, k: Optional[int] = None) -> List[int]:
+        """Bayes Global + Frequência/Atraso (Momentum)."""
+        return self._combine_and_select(self.post_probs_global_, self.momentum_scores_, k=k)
+
+    def predict_bayes_global_balanced(self, k: Optional[int] = None) -> List[int]:
+        """Bayes Global + Frequência/Atraso (Balanceado)."""
+        return self._combine_and_select(self.post_probs_global_, self.balanced_scores_, k=k)
+
+    # 3. Bayes Adaptativo + Auxiliares
+    def predict_bayes_adaptive_logistic_regression(self, k: Optional[int] = None) -> List[int]:
+        """Bayes Adaptativo + Regressão Logística."""
+        return self._combine_and_select(self.post_probs_adaptive_, self.ml_scores_, k=k)
+
+    def predict_bayes_adaptive_momentum(self, k: Optional[int] = None) -> List[int]:
+        """Bayes Adaptativo + Frequência/Atraso (Momentum)."""
+        return self._combine_and_select(self.post_probs_adaptive_, self.momentum_scores_, k=k)
+
+    def predict_bayes_adaptive_balanced(self, k: Optional[int] = None) -> List[int]:
+        """Bayes Adaptativo + Frequência/Atraso (Balanceado)."""
+        return self._combine_and_select(self.post_probs_adaptive_, self.balanced_scores_, k=k)
 
     def get_summary_df(self) -> pd.DataFrame:
         """Retorna o DataFrame consolidado com escores e probabilidades."""
@@ -1422,6 +1585,270 @@ def predict_gianella_best_bayes_decision(binary_matrix: np.ndarray,
     return model.predict_gianella_best_bayes_decision(k)
 
 
+def predict_gianella_logistic_regression(binary_matrix: np.ndarray,
+                                        cfg: Dict,
+                                        k: Optional[int] = None,
+                                        ml_scores: Optional[np.ndarray] = None) -> List[int]:
+    """Predição direta unindo o Gabarito de Gianella com Regressão Logística Calibrada."""
+    model = GianellaBayesHybridModel(
+        n_dezenas=cfg['n_dezenas'],
+        k=cfg['k'] if k is None else k,
+        group_size=cfg.get('gianella_group_size', 10),
+        alpha_0=cfg.get('alpha_0', 1.0),
+        beta_0=cfg.get('beta_0', 1.0)
+    )
+    model.fit(binary_matrix, ml_scores=ml_scores)
+    return model.predict_gianella_logistic_regression(k)
+
+
+def predict_gianella_momentum(binary_matrix: np.ndarray,
+                              cfg: Dict,
+                              k: Optional[int] = None,
+                              momentum_scores: Optional[np.ndarray] = None) -> List[int]:
+    """Predição direta unindo o Gabarito de Gianella com Frequência/Atraso (Momentum)."""
+    model = GianellaBayesHybridModel(
+        n_dezenas=cfg['n_dezenas'],
+        k=cfg['k'] if k is None else k,
+        group_size=cfg.get('gianella_group_size', 10),
+        alpha_0=cfg.get('alpha_0', 1.0),
+        beta_0=cfg.get('beta_0', 1.0)
+    )
+    model.fit(binary_matrix, momentum_scores=momentum_scores)
+    return model.predict_gianella_momentum(k)
+
+
+def predict_gianella_balanced(binary_matrix: np.ndarray,
+                              cfg: Dict,
+                              k: Optional[int] = None,
+                              balanced_scores: Optional[np.ndarray] = None) -> List[int]:
+    """Predição direta unindo o Gabarito de Gianella com Frequência/Atraso (Balanceado)."""
+    model = GianellaBayesHybridModel(
+        n_dezenas=cfg['n_dezenas'],
+        k=cfg['k'] if k is None else k,
+        group_size=cfg.get('gianella_group_size', 10),
+        alpha_0=cfg.get('alpha_0', 1.0),
+        beta_0=cfg.get('beta_0', 1.0)
+    )
+    model.fit(binary_matrix, balanced_scores=balanced_scores)
+    return model.predict_gianella_balanced(k)
+
+
+class BayesianHybridModel:
+    """
+    Modelagem Preditiva Híbrida Bayesiana & Teoria da Decisão sob Incerteza.
+    Combina distribuições a posteriori e utilidades bayesianas com modelos auxiliares:
+    - Regressão Logística (Probabilidades Calibradas Multi-label)
+    - Frequência Ponderada Temporal (Momentum Recente)
+    - Escore Padronizado Frequência + Atraso (Balanceado)
+    """
+
+    def __init__(self,
+                 n_dezenas: int = 60,
+                 k: int = 6,
+                 alpha_0: float = 1.0,
+                 beta_0: float = 9.0,
+                 decay_half_life: float = 150.0,
+                 risk_penalty: float = 0.0,
+                 random_state: int = 42):
+        self.n_dezenas = n_dezenas
+        self.k = k
+        self.alpha_0 = alpha_0
+        self.beta_0 = beta_0
+        self.decay_half_life = decay_half_life
+        self.risk_penalty = risk_penalty
+        self.random_state = random_state
+
+        self.post_probs_global_: Optional[np.ndarray] = None
+        self.post_probs_adaptive_: Optional[np.ndarray] = None
+        self.bayes_decision_scores_: Optional[np.ndarray] = None
+        self.cov_matrix_: Optional[np.ndarray] = None
+        self.ml_scores_: Optional[np.ndarray] = None
+        self.momentum_scores_: Optional[np.ndarray] = None
+        self.balanced_scores_: Optional[np.ndarray] = None
+
+    def fit(self,
+            binary_matrix: np.ndarray,
+            consensus_scores: Optional[np.ndarray] = None,
+            ml_scores: Optional[np.ndarray] = None,
+            momentum_scores: Optional[np.ndarray] = None,
+            balanced_scores: Optional[np.ndarray] = None) -> 'BayesianHybridModel':
+        n_concursos = binary_matrix.shape[0]
+        n_obs = float(n_concursos)
+        x_obs = binary_matrix.sum(axis=0).astype(float)
+        post_alpha_global = self.alpha_0 + x_obs
+        post_beta_global = self.beta_0 + n_obs - x_obs
+        self.post_probs_global_ = post_alpha_global / (post_alpha_global + post_beta_global)
+
+        gamma = 0.5 ** (1.0 / self.decay_half_life)
+        weights = gamma ** np.arange(n_concursos - 1, -1, -1)
+        eff_n = float(np.sum(weights))
+        eff_x = np.sum(binary_matrix * weights[:, None], axis=0)
+        post_alpha_dyn = self.alpha_0 + eff_x
+        post_beta_dyn = self.beta_0 + eff_n - eff_x
+        self.post_probs_adaptive_ = post_alpha_dyn / (post_alpha_dyn + post_beta_dyn)
+
+        if n_concursos > 1:
+            self.cov_matrix_ = np.cov(binary_matrix, rowvar=False)
+        else:
+            self.cov_matrix_ = np.zeros((self.n_dezenas, self.n_dezenas))
+
+        if consensus_scores is not None and len(consensus_scores) == self.n_dezenas:
+            c_arr = np.array(consensus_scores, dtype=float)
+            max_c = np.max(c_arr)
+            c_norm = c_arr / max_c if max_c > 0 else c_arr
+            p_joint = 0.5 * (self.post_probs_global_ + self.post_probs_adaptive_)
+            self.bayes_decision_scores_ = 0.5 * p_joint + 0.5 * c_norm
+        else:
+            self.bayes_decision_scores_ = 0.5 * self.post_probs_global_ + 0.5 * self.post_probs_adaptive_
+
+        m1_needed = (momentum_scores is None or len(momentum_scores) != self.n_dezenas or
+                     balanced_scores is None or len(balanced_scores) != self.n_dezenas)
+        if m1_needed:
+            m1_model = FrequencyDelayModel(half_life=100.0, alpha=0.5)
+            m1_model.fit(binary_matrix)
+
+        if momentum_scores is not None and len(momentum_scores) == self.n_dezenas:
+            self.momentum_scores_ = _min_max_scale(momentum_scores)
+        else:
+            mom = np.zeros(self.n_dezenas, dtype=float)
+            for _, r in m1_model.scores_df_.iterrows():
+                mom[int(r['dezena']) - 1] = float(r['freq_ponderada'])
+            self.momentum_scores_ = _min_max_scale(mom)
+
+        if balanced_scores is not None and len(balanced_scores) == self.n_dezenas:
+            self.balanced_scores_ = _min_max_scale(balanced_scores)
+        else:
+            bal = np.zeros(self.n_dezenas, dtype=float)
+            for _, r in m1_model.scores_df_.iterrows():
+                bal[int(r['dezena']) - 1] = float(r['escore_composto'])
+            self.balanced_scores_ = _min_max_scale(bal)
+
+        if ml_scores is not None and len(ml_scores) == self.n_dezenas:
+            self.ml_scores_ = _min_max_scale(ml_scores)
+        else:
+            if n_concursos > 30:
+                try:
+                    min_hist = min(100, max(20, n_concursos // 2))
+                    m2_model = MultiLabelMLModel(estimator='logistic_regression', min_train_history=min_hist, random_state=42)
+                    m2_model.fit(binary_matrix)
+                    df_probs = m2_model.get_probabilities_df()
+                    ml_arr = np.zeros(self.n_dezenas, dtype=float)
+                    for _, r in df_probs.iterrows():
+                        ml_arr[int(r['dezena']) - 1] = float(r['probabilidade_calibrada_sorteio'])
+                    self.ml_scores_ = _min_max_scale(ml_arr)
+                except Exception:
+                    self.ml_scores_ = self.momentum_scores_.copy()
+            else:
+                self.ml_scores_ = self.momentum_scores_.copy()
+
+        return self
+
+    def _combine_and_select(self, base_scores: np.ndarray, aux_scores: np.ndarray, k: Optional[int] = None) -> List[int]:
+        if k is None:
+            k = self.k
+        comb = 0.5 * _min_max_scale(base_scores) + 0.5 * _min_max_scale(aux_scores)
+        return _select_top_k_greedy(comb, k=k, cov_matrix=self.cov_matrix_, risk_penalty=self.risk_penalty)
+
+    def predict_best_bayes_logistic_regression(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.bayes_decision_scores_, self.ml_scores_, k=k)
+
+    def predict_best_bayes_momentum(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.bayes_decision_scores_, self.momentum_scores_, k=k)
+
+    def predict_best_bayes_balanced(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.bayes_decision_scores_, self.balanced_scores_, k=k)
+
+    def predict_bayes_global_logistic_regression(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.post_probs_global_, self.ml_scores_, k=k)
+
+    def predict_bayes_global_momentum(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.post_probs_global_, self.momentum_scores_, k=k)
+
+    def predict_bayes_global_balanced(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.post_probs_global_, self.balanced_scores_, k=k)
+
+    def predict_bayes_adaptive_logistic_regression(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.post_probs_adaptive_, self.ml_scores_, k=k)
+
+    def predict_bayes_adaptive_momentum(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.post_probs_adaptive_, self.momentum_scores_, k=k)
+
+    def predict_bayes_adaptive_balanced(self, k: Optional[int] = None) -> List[int]:
+        return self._combine_and_select(self.post_probs_adaptive_, self.balanced_scores_, k=k)
+
+
+def predict_best_bayes_logistic_regression(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Melhor Decisão de Bayes + Regressão Logística."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_best_bayes_logistic_regression(k)
+
+
+def predict_best_bayes_momentum(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Melhor Decisão de Bayes + Frequência/Atraso (Momentum)."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_best_bayes_momentum(k)
+
+
+def predict_best_bayes_balanced(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Melhor Decisão de Bayes + Frequência/Atraso (Balanceado)."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_best_bayes_balanced(k)
+
+
+def predict_bayes_global_logistic_regression(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Bayes Global + Regressão Logística."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_bayes_global_logistic_regression(k)
+
+
+def predict_bayes_global_momentum(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Bayes Global + Frequência/Atraso (Momentum)."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_bayes_global_momentum(k)
+
+
+def predict_bayes_global_balanced(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Bayes Global + Frequência/Atraso (Balanceado)."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_bayes_global_balanced(k)
+
+
+def predict_bayes_adaptive_logistic_regression(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Bayes Adaptativo + Regressão Logística."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_bayes_adaptive_logistic_regression(k)
+
+
+def predict_bayes_adaptive_momentum(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Bayes Adaptativo + Frequência/Atraso (Momentum)."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_bayes_adaptive_momentum(k)
+
+
+def predict_bayes_adaptive_balanced(binary_matrix: np.ndarray, cfg: Dict, k: Optional[int] = None) -> List[int]:
+    """Bayes Adaptativo + Frequência/Atraso (Balanceado)."""
+    model = BayesianHybridModel(n_dezenas=cfg['n_dezenas'], k=cfg['k'] if k is None else k,
+                                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 1.0))
+    model.fit(binary_matrix)
+    return model.predict_bayes_adaptive_balanced(k)
+
+
 # ==============================================================================
 # 4. FUNÇÃO COMPARATIVA E RELATÓRIO EXECUTIVO
 # ==============================================================================
@@ -1494,6 +1921,22 @@ def run_all_lottery_methods(filepath: str,
             ball_scores[ball - 1] += w
     pred_consenso = sorted(list(np.argsort(ball_scores)[::-1][:k] + 1))
 
+    # Escores auxiliares para os métodos híbridos
+    mom_scores = np.zeros(cfg['n_dezenas'], dtype=float)
+    bal_scores = np.zeros(cfg['n_dezenas'], dtype=float)
+    for _, r in m1.scores_df_.iterrows():
+        d_idx = int(r['dezena']) - 1
+        mom_scores[d_idx] = float(r['freq_ponderada'])
+        bal_scores[d_idx] = float(r['escore_composto'])
+
+    ml_scores = np.zeros(cfg['n_dezenas'], dtype=float)
+    try:
+        df_probs = m2.get_probabilities_df()
+        for _, r in df_probs.iterrows():
+            ml_scores[int(r['dezena']) - 1] = float(r['probabilidade_calibrada_sorteio'])
+    except Exception:
+        ml_scores = mom_scores.copy()
+
     # 5. Métodos Híbridos Gianella + Bayes
     m_hybrid = GianellaBayesHybridModel(
         n_dezenas=cfg['n_dezenas'],
@@ -1503,15 +1946,44 @@ def run_all_lottery_methods(filepath: str,
         beta_0=beta_0,
         decay_half_life=150.0
     )
-    m_hybrid.fit(binary_matrix, consensus_scores=ball_scores)
+    m_hybrid.fit(binary_matrix, consensus_scores=ball_scores, ml_scores=ml_scores,
+                 momentum_scores=mom_scores, balanced_scores=bal_scores)
+
     pred_g_bayes_global = m_hybrid.predict_gianella_bayes_global(k)
     pred_g_bayes_adaptive = m_hybrid.predict_gianella_bayes_adaptive(k)
     pred_g_best_bayes = m_hybrid.predict_gianella_best_bayes_decision(k)
+    pred_g_lr = m_hybrid.predict_gianella_logistic_regression(k)
+    pred_g_mom = m_hybrid.predict_gianella_momentum(k)
+    pred_g_bal = m_hybrid.predict_gianella_balanced(k)
+
+    pred_bb_lr = m_hybrid.predict_best_bayes_logistic_regression(k)
+    pred_bb_mom = m_hybrid.predict_best_bayes_momentum(k)
+    pred_bb_bal = m_hybrid.predict_best_bayes_balanced(k)
+
+    pred_bg_lr = m_hybrid.predict_bayes_global_logistic_regression(k)
+    pred_bg_mom = m_hybrid.predict_bayes_global_momentum(k)
+    pred_bg_bal = m_hybrid.predict_bayes_global_balanced(k)
+
+    pred_ba_lr = m_hybrid.predict_bayes_adaptive_logistic_regression(k)
+    pred_ba_mom = m_hybrid.predict_bayes_adaptive_momentum(k)
+    pred_ba_bal = m_hybrid.predict_bayes_adaptive_balanced(k)
 
     predictions_hybrid = {
         'Gianella + Bayes Global': pred_g_bayes_global,
         'Gianella + Bayes Adaptativo': pred_g_bayes_adaptive,
-        'Gianella + Melhor Decisão de Bayes': pred_g_best_bayes
+        'Gianella + Melhor Decisão de Bayes': pred_g_best_bayes,
+        'Gianella + Regressão Logística': pred_g_lr,
+        'Gianella + Freq/Atraso (Momentum)': pred_g_mom,
+        'Gianella + Freq/Atraso (Balanceado)': pred_g_bal,
+        'Melhor Decisão de Bayes + Regressão Logística': pred_bb_lr,
+        'Melhor Decisão de Bayes + Freq/Atraso (Momentum)': pred_bb_mom,
+        'Melhor Decisão de Bayes + Freq/Atraso (Balanceado)': pred_bb_bal,
+        'Bayes Global + Regressão Logística': pred_bg_lr,
+        'Bayes Global + Frequência/Atraso (Momentum)': pred_bg_mom,
+        'Bayes Global + Frequência/Atraso (Balanceado)': pred_bg_bal,
+        'Bayes Adaptativo + Regressão Logística': pred_ba_lr,
+        'Bayes Adaptativo + Frequência/Atraso (Momentum)': pred_ba_mom,
+        'Bayes Adaptativo + Frequência/Atraso (Balanceado)': pred_ba_bal
     }
 
     predictions = {
@@ -1529,6 +2001,18 @@ def run_all_lottery_methods(filepath: str,
         predictions['Metodo 5 (Gianella + Bayes Global)'] = pred_g_bayes_global
         predictions['Metodo 6 (Gianella + Bayes Adaptativo)'] = pred_g_bayes_adaptive
         predictions['Metodo 7 (Gianella + Melhor Decisao de Bayes)'] = pred_g_best_bayes
+        predictions['Metodo 8 (Gianella + Regressao Logistica)'] = pred_g_lr
+        predictions['Metodo 9 (Gianella + Freq/Atraso Momentum)'] = pred_g_mom
+        predictions['Metodo 10 (Gianella + Freq/Atraso Balanceado)'] = pred_g_bal
+        predictions['Metodo 11 (Melhor Decisao Bayes + Regressao Logistica)'] = pred_bb_lr
+        predictions['Metodo 12 (Melhor Decisao Bayes + Freq/Atraso Momentum)'] = pred_bb_mom
+        predictions['Metodo 13 (Melhor Decisao Bayes + Freq/Atraso Balanceado)'] = pred_bb_bal
+        predictions['Metodo 14 (Bayes Global + Regressao Logistica)'] = pred_bg_lr
+        predictions['Metodo 15 (Bayes Global + Frequencia/Atraso Momentum)'] = pred_bg_mom
+        predictions['Metodo 16 (Bayes Global + Frequencia/Atraso Balanceado)'] = pred_bg_bal
+        predictions['Metodo 17 (Bayes Adaptativo + Regressao Logistica)'] = pred_ba_lr
+        predictions['Metodo 18 (Bayes Adaptativo + Frequencia/Atraso Momentum)'] = pred_ba_mom
+        predictions['Metodo 19 (Bayes Adaptativo + Frequencia/Atraso Balanceado)'] = pred_ba_bal
 
     comparison_records = []
     for name, nums in predictions.items():
