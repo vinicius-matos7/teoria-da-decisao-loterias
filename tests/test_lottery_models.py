@@ -23,6 +23,10 @@ from mega_sena_models import (
     LotteryPastingModel,
     LotteryAdaBoostModel,
     LotteryGradientBoostingModel,
+    LotteryStochasticGradientBoostingModel,
+    LotteryLogitGradientBoostingModel,
+    LotteryBinomialDevianceGradientBoostingModel,
+    LotteryResidualCyclingGradientBoostingModel,
     LotteryStackingModel,
     predict_gianella_bayes_global,
     predict_gianella_bayes_adaptive,
@@ -43,6 +47,10 @@ from mega_sena_models import (
     predict_pasting,
     predict_adaboost,
     predict_gradient_boosting,
+    predict_stochastic_gradient_boosting,
+    predict_logit_gradient_boosting,
+    predict_binomial_deviance_gradient_boosting,
+    predict_residual_cycling_gradient_boosting,
     predict_stacking,
     run_all_lottery_methods
 )
@@ -372,6 +380,117 @@ class TestModelsExecution:
         with pytest.raises(ValueError):
             LotteryGradientBoostingModel().fit(np.zeros((0, 60)))
 
+    def test_lottery_stochastic_gradient_boosting_model(self, synthetic_data):
+        cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
+        m_sgb = LotteryStochasticGradientBoostingModel(n_estimators=5, learning_rate=0.5, subsample=0.7, random_state=42)
+        m_sgb.fit(synthetic_data, cfg=cfg)
+
+        top6 = m_sgb.predict_top_k(6)
+        assert len(top6) == 6
+        assert len(set(top6)) == 6
+        assert all(1 <= d <= 60 for d in top6)
+
+        staged = list(m_sgb.staged_predict_top_k(6))
+        assert len(staged) == 6  # F_0 + 5 stages
+        for stage_bet in staged:
+            assert len(stage_bet) == 6
+            assert len(set(stage_bet)) == 6
+            assert all(1 <= d <= 60 for d in stage_bet)
+
+        scores_df = m_sgb.get_scores_df()
+        assert len(scores_df) == 60
+        assert 'escore_stoch_gradboost' in scores_df.columns
+        assert 'escore_acumulado' in scores_df.columns
+
+        # Edge cases & validation
+        assert len(m_sgb.predict_top_k(0)) == 0
+        assert len(m_sgb.predict_top_k(70)) == 60
+
+        with pytest.raises(ValueError):
+            LotteryStochasticGradientBoostingModel(n_estimators=0)
+        with pytest.raises(ValueError):
+            LotteryStochasticGradientBoostingModel(learning_rate=0.0)
+        with pytest.raises(ValueError):
+            LotteryStochasticGradientBoostingModel(subsample=0.0)
+        with pytest.raises(ValueError):
+            LotteryStochasticGradientBoostingModel(subsample=1.5)
+        with pytest.raises(ValueError):
+            LotteryStochasticGradientBoostingModel().fit(np.zeros((0, 60)))
+
+    def test_lottery_logit_gradient_boosting_model(self, synthetic_data):
+        cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
+        m_lgb = LotteryLogitGradientBoostingModel(n_estimators=5, learning_rate=0.3, random_state=42)
+        m_lgb.fit(synthetic_data, cfg=cfg)
+
+        top6 = m_lgb.predict_top_k(6)
+        assert len(top6) == 6
+        assert len(set(top6)) == 6
+        assert all(1 <= d <= 60 for d in top6)
+
+        staged = list(m_lgb.staged_predict_top_k(6))
+        assert len(staged) == 6  # F_0 + 5 stages
+        for stage_bet in staged:
+            assert len(stage_bet) == 6
+            assert len(set(stage_bet)) == 6
+            assert all(1 <= d <= 60 for d in stage_bet)
+
+        scores_df = m_lgb.get_scores_df()
+        assert len(scores_df) == 60
+        assert 'escore_logit_gradboost' in scores_df.columns
+        assert 'probabilidade_calibrada' in scores_df.columns
+        assert 'logit_escore' in scores_df.columns
+        assert all(0.0 <= p <= 1.0 for p in scores_df['probabilidade_calibrada'])
+
+        # Edge cases & validation
+        assert len(m_lgb.predict_top_k(0)) == 0
+        assert len(m_lgb.predict_top_k(70)) == 60
+
+        with pytest.raises(ValueError):
+            LotteryLogitGradientBoostingModel(n_estimators=0)
+        with pytest.raises(ValueError):
+            LotteryLogitGradientBoostingModel(learning_rate=0.0)
+        with pytest.raises(ValueError):
+            LotteryLogitGradientBoostingModel().fit(np.zeros((0, 60)))
+
+    def test_lottery_residual_cycling_gradient_boosting_model(self, synthetic_data):
+        cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
+        m_rcgb = LotteryResidualCyclingGradientBoostingModel(n_estimators=8, learning_rate=0.4, random_state=42)
+        m_rcgb.fit(synthetic_data, cfg=cfg)
+
+        top6 = m_rcgb.predict_top_k(6)
+        assert len(top6) == 6
+        assert len(set(top6)) == 6
+        assert all(1 <= d <= 60 for d in top6)
+
+        assert len(m_rcgb.stage_models_) == 8
+        assert set(m_rcgb.stage_models_) == {'ml_logistic', 'gianella', 'delay_momentum', 'bayes_adaptive'}
+
+        staged = list(m_rcgb.staged_predict_top_k(6))
+        assert len(staged) == 9  # F_0 + 8 stages
+        for stage_bet in staged:
+            assert len(stage_bet) == 6
+            assert len(set(stage_bet)) == 6
+            assert all(1 <= d <= 60 for d in stage_bet)
+
+        scores_df = m_rcgb.get_scores_df()
+        assert len(scores_df) == 60
+        assert 'escore_cycling_gradboost' in scores_df.columns
+
+        # Edge cases & validation
+        assert len(m_rcgb.predict_top_k(0)) == 0
+        assert len(m_rcgb.predict_top_k(70)) == 60
+
+        with pytest.raises(ValueError):
+            LotteryResidualCyclingGradientBoostingModel(n_estimators=0)
+        with pytest.raises(ValueError):
+            LotteryResidualCyclingGradientBoostingModel(learning_rate=0.0)
+        with pytest.raises(ValueError):
+            LotteryResidualCyclingGradientBoostingModel(base_cycle=[])
+        with pytest.raises(ValueError):
+            LotteryResidualCyclingGradientBoostingModel(base_cycle=['invalid_model'])
+        with pytest.raises(ValueError):
+            LotteryResidualCyclingGradientBoostingModel().fit(np.zeros((0, 60)))
+
     def test_lottery_pasting_model(self, synthetic_data):
         cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
         m_paste = LotteryPastingModel(n_estimators=5, max_samples=0.8, random_state=42)
@@ -437,9 +556,16 @@ class TestModelsExecution:
         p_paste = predict_pasting(synthetic_data, cfg, k=6, n_estimators=3)
         p_ada = predict_adaboost(synthetic_data, cfg, k=6, n_estimators=3)
         p_gb = predict_gradient_boosting(synthetic_data, cfg, k=6, n_estimators=3)
+        p_sgb = predict_stochastic_gradient_boosting(synthetic_data, cfg, k=6, n_estimators=3)
+        p_lgb = predict_logit_gradient_boosting(synthetic_data, cfg, k=6, n_estimators=3)
+        p_bdgb = predict_binomial_deviance_gradient_boosting(synthetic_data, cfg, k=6, n_estimators=3)
+        p_rcgb = predict_residual_cycling_gradient_boosting(synthetic_data, cfg, k=6, n_estimators=4)
         p_stack = predict_stacking(synthetic_data, cfg, k=6)
 
-        for name, bet in [('bagging', p_bag), ('pasting', p_paste), ('adaboost', p_ada), ('gradboost', p_gb), ('stacking', p_stack)]:
+        for name, bet in [('bagging', p_bag), ('pasting', p_paste), ('adaboost', p_ada),
+                          ('gradboost', p_gb), ('stoch_gb', p_sgb), ('logit_gb', p_lgb),
+                          ('binomial_deviance_gb', p_bdgb), ('residual_cycling_gb', p_rcgb),
+                          ('stacking', p_stack)]:
             assert len(bet) == 6, f"Tamanho incorreto para {name}"
             assert len(set(bet)) == 6, f"Dezenas repetidas em {name}"
             assert all(1 <= d <= 60 for d in bet), f"Dezenas fora da faixa em {name}"
@@ -484,7 +610,8 @@ class TestRunAllLotteryMethods:
         
         required_keys = ['df_raw', 'binary_matrix', 'cfg', 'm1_model', 'm2_model',
                          'm3_static', 'm3_dyn', 'm4_gianella', 'm_bagging', 'm_pasting', 'm_adaboost',
-                         'm_gradboost', 'm_stacking', 'predictions', 'predictions_ensemble', 'comparison_df']
+                         'm_gradboost', 'm_stoch_gb', 'm_logit_gb', 'm_cycle_gb', 'm_stacking',
+                         'predictions', 'predictions_ensemble', 'comparison_df']
         for k in required_keys:
             assert k in results, f"Chave {k} ausente em results"
             
@@ -492,7 +619,7 @@ class TestRunAllLotteryMethods:
         assert results['cfg']['n_dezenas'] == expected_n
         assert len(results['predictions']) == 7
         assert len(results['comparison_df']) == 7
-        assert len(results['predictions_ensemble']) == 5
+        assert len(results['predictions_ensemble']) == 8
         
         for name, bet in results['predictions'].items():
             assert len(bet) == expected_k, f"Tamanho incorreto para {name}: {len(bet)} != {expected_k}"
@@ -518,16 +645,16 @@ class TestRunAllLotteryMethods:
 
         required_keys = ['df_raw', 'binary_matrix', 'cfg', 'm1_model', 'm2_model',
                          'm3_static', 'm3_dyn', 'm4_gianella', 'm_hybrid', 'm_bagging', 'm_pasting',
-                         'm_adaboost', 'm_gradboost', 'm_stacking', 'pred_consenso',
-                         'consensus_scores', 'predictions', 'predictions_hybrid',
+                         'm_adaboost', 'm_gradboost', 'm_stoch_gb', 'm_logit_gb', 'm_cycle_gb', 'm_stacking',
+                         'pred_consenso', 'consensus_scores', 'predictions', 'predictions_hybrid',
                          'predictions_ensemble', 'comparison_df']
         for k in required_keys:
             assert k in results, f"Chave {k} ausente em results"
 
-        assert len(results['predictions']) == 28
-        assert len(results['comparison_df']) == 28
+        assert len(results['predictions']) == 31
+        assert len(results['comparison_df']) == 31
         assert len(results['predictions_hybrid']) == 15
-        assert len(results['predictions_ensemble']) == 5
+        assert len(results['predictions_ensemble']) == 8
 
         for name, bet in results['predictions'].items():
             assert len(bet) == expected_k, f"Tamanho incorreto para {name}: {len(bet)} != {expected_k}"

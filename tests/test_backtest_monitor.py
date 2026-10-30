@@ -514,7 +514,16 @@ class TestEdgeCasesAndRobustness:
         monitor.binary_matrix = matrix
         monitor.n_concursos = n_concursos
 
-        ensemble_models = ['Ensemble Bagging', 'Ensemble Pasting', 'Ensemble AdaBoost', 'Ensemble Gradient Boosting', 'Ensemble Stacking']
+        ensemble_models = [
+            'Ensemble Bagging',
+            'Ensemble Pasting',
+            'Ensemble AdaBoost',
+            'Ensemble Gradient Boosting',
+            'Ensemble Stochastic Gradient Boosting',
+            'Ensemble Logit Gradient Boosting',
+            'Ensemble Residual Cycling Gradient Boosting',
+            'Ensemble Stacking'
+        ]
         monitor.run_walk_forward(n_contests=2, models_to_run=ensemble_models, verbose=False)
 
         assert len(monitor.raw_results_df) == 2 * len(ensemble_models)

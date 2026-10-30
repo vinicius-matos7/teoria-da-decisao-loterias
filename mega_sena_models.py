@@ -2497,6 +2497,531 @@ class LotteryGradientBoostingModel:
         return self.scores_df_.copy()
 
 
+class LotteryStochasticGradientBoostingModel:
+    """
+    Ensemble Stochastic Gradient Boosting para Seleção de Dezenas em Loterias.
+    Baseado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 7:
+    'Stochastic Gradient Boosting' (Jerome H. Friedman, 2002, Computational Statistics & Data Analysis).
+
+    Fundamentação Teórica e Algorítmica (Géron p. 207):
+    1. Amostragem Aleatória de Subconjuntos (Subsample):
+       A cada iteração de boosting m, uma fração aleatória 'subsample' (ex.: 0.7 ou 70%) dos concursos
+       históricos é sorteada sem reposição. O preditor residual h_m é ajustado exclusivamente sobre essa
+       amostra estocástica de concursos.
+    2. Redução Drástica de Variância e Combate ao Sobreajuste:
+       A injeção de estocasticidade desacopla os preditores residuais sequenciais, mitigando a correlação
+       entre erros sucessivos e proporcionando um efeito de regularização similar ao Bagging dentro do Boosting.
+    3. Atualização Regularizada por Encolhimento (Shrinkage, Géron p. 205):
+       F_m = F_{m-1} + learning_rate * (h_norm - 0.5)
+    4. Predição Estagiada (Staged Predict, Géron p. 206):
+       Permite inspecionar a convergência das estimativas concurso a concurso.
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 learning_rate: float = 0.5,
+                 subsample: float = 0.7,
+                 random_state: int = 42,
+                 base_models: Optional[List[str]] = None):
+        """
+        Parameters
+        ----------
+        n_estimators : int
+            Número de estágios de boosting (default 10).
+        learning_rate : float
+            Taxa de aprendizado / encolhimento eta (default 0.5).
+        subsample : float
+            Fração de concursos históricos amostrados a cada estágio (0 < subsample <= 1.0, default 0.7).
+        random_state : int
+            Semente para amostragem estocástica reprodutível.
+        base_models : Optional[List[str]]
+            Estratégias de resíduo a utilizar.
+        """
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser estritamente positivo (> 0). Recebido: {n_estimators}")
+        if learning_rate <= 0:
+            raise ValueError(f"learning_rate deve ser estritamente positivo (> 0). Recebido: {learning_rate}")
+        if not (0.0 < subsample <= 1.0):
+            raise ValueError(f"subsample deve estar no intervalo (0.0, 1.0]. Recebido: {subsample}")
+
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.subsample = subsample
+        self.random_state = random_state
+        self.base_models = base_models
+
+        self.staged_scores_: List[np.ndarray] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryStochasticGradientBoostingModel':
+        """
+        Ajusta sequencialmente o Stochastic Gradient Boosting com amostragem aleatória a cada iteração.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+
+        # 1. Estimativa inicial F_0 (Esperança a priori bayesiana suavizada)
+        alpha_0 = cfg.get('alpha_0', 1.0)
+        beta_0 = cfg.get('beta_0', 9.0)
+        F_current = (binary_matrix.sum(axis=0) + alpha_0) / (n_concursos + alpha_0 + beta_0)
+        F_current = _min_max_scale(F_current)
+
+        # Resíduos iniciais completos
+        residuals = binary_matrix.astype(float) - F_current[None, :]
+        self.staged_scores_ = [F_current.copy()]
+
+        rng = np.random.RandomState(self.random_state)
+        n_sample = max(2, int(np.floor(self.subsample * n_concursos)))
+        n_sample = min(n_sample, n_concursos)
+
+        for m in range(self.n_estimators):
+            # 2. Sorteio Estocástico dos concursos históricos (Géron p. 207; Friedman 2002)
+            if n_sample < n_concursos:
+                sub_indices = np.sort(rng.choice(n_concursos, size=n_sample, replace=False))
+            else:
+                sub_indices = np.arange(n_concursos)
+
+            sub_residuals = residuals[sub_indices, :]
+
+            # Decaimento temporal adaptativo no subconjunto amostrado
+            half_life = 50.0 + (m * 20.0)
+            decay = 0.5 ** (1.0 / half_life)
+            time_weights = decay ** np.arange(len(sub_indices) - 1, -1, -1)
+            time_weights /= np.sum(time_weights)
+
+            # Gradiente residual estocástico ponderado
+            h_m = np.sum(sub_residuals * time_weights[:, None], axis=0)
+            h_norm = _min_max_scale(h_m)
+
+            # 3. Atualização do ensemble com regularização por encolhimento (Shrinkage)
+            F_current = F_current + self.learning_rate * (h_norm - 0.5)
+            F_current = np.clip(F_current, 0.0, None)
+
+            # 4. Atualização dos resíduos em toda a base histórica
+            residuals = residuals - self.learning_rate * (h_norm[None, :] - 0.5)
+            self.staged_scores_.append(_min_max_scale(F_current).copy())
+
+        final_scores = _min_max_scale(F_current)
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_stoch_gradboost': np.round(final_scores, 5),
+            'escore_acumulado': np.round(F_current, 5)
+        }).sort_values('escore_stoch_gradboost', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo Stochastic Gradient Boosting.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted(self.scores_df_.head(k)['dezena'].tolist())
+
+    def staged_predict_top_k(self, k: Optional[int] = None) -> Generator[List[int], None, None]:
+        """
+        Iterador sobre as predições do ensemble em cada estágio de treinamento (Géron p. 206).
+        """
+        if not self.staged_scores_:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        k = k if k is not None else (len(self.top_k_) if self.top_k_ is not None else 6)
+        for s in self.staged_scores_:
+            if k <= 0:
+                yield []
+            else:
+                k_actual = min(k, len(s))
+                yield sorted(list(np.argsort(s)[::-1][:k_actual] + 1))
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do Stochastic Gradient Boosting."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+class LotteryLogitGradientBoostingModel:
+    """
+    Ensemble Log-Loss / Binomial Deviance Gradient Boosting para Seleção de Dezenas em Loterias.
+    Baseado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 7 ('Gradient Boosting')
+    e Jerome H. Friedman (2001), 'Greedy Function Approximation: A Gradient Boosting Machine'
+    (Section 4.2: Binomial Deviance / Two-Class Classification).
+
+    Fundamentação Matemática:
+    1. Espaço de Log-Odds (Logits) e Função Sigmoide:
+       A previsão do modelo reside no espaço não-delimitado dos log-odds F(d) in (-inf, +inf).
+       A probabilidade calibrada de ocorrência da dezena d é dada pela função sigmoide:
+       p(d) = sigma(F(d)) = 1 / (1 + exp(-F(d)))
+    2. Função de Perda de Entropia Cruzada Binária (Binomial Deviance Loss):
+       L(y, F) = - [ y * ln(sigma(F)) + (1 - y) * ln(1 - sigma(F)) ] = ln(1 + exp(F)) - y * F
+    3. Resíduo de Gradiente Negativo (Pseudo-Resíduo):
+       - dL / dF = y - sigma(F) = y - p
+       O gradiente negativo aponta exatamente na direção do erro de probabilidade (y - p).
+    4. Atualização de Newton-Raphson com Regularização por Encolhimento (Shrinkage):
+       gamma_{m}(d) = sum_t w_t * (y_{t, d} - p_{t, d}) / (sum_t w_t * p_{t, d} * (1 - p_{t, d}) + epsilon)
+       F_m(d) = F_{m-1}(d) + learning_rate * gamma_{step}
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 learning_rate: float = 0.3,
+                 random_state: int = 42,
+                 base_models: Optional[List[str]] = None):
+        """
+        Parameters
+        ----------
+        n_estimators : int
+            Número de iterações de boosting no espaço de logit (default 10).
+        learning_rate : float
+            Taxa de aprendizado / encolhimento no espaço log-odds (default 0.3).
+        random_state : int
+            Semente para reprodutibilidade.
+        base_models : Optional[List[str]]
+            Lista de modelos auxiliares (opcional).
+        """
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser estritamente positivo (> 0). Recebido: {n_estimators}")
+        if learning_rate <= 0:
+            raise ValueError(f"learning_rate deve ser estritamente positivo (> 0). Recebido: {learning_rate}")
+
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.random_state = random_state
+        self.base_models = base_models
+
+        self.staged_scores_: List[np.ndarray] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryLogitGradientBoostingModel':
+        """
+        Ajusta o Gradient Boosting de Deviância Binomial no espaço de logits.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+
+        # 1. Inicialização F_0(d) = log-odds da priori suavizada (Friedman 2001, Eq. 25)
+        alpha_0 = cfg.get('alpha_0', 1.0)
+        beta_0 = cfg.get('beta_0', 9.0)
+        p_0 = (binary_matrix.sum(axis=0) + alpha_0) / (n_concursos + alpha_0 + beta_0)
+        p_0 = np.clip(p_0, 1e-4, 1.0 - 1e-4)
+        F_current = np.log(p_0 / (1.0 - p_0))
+        prob_current = 1.0 / (1.0 + np.exp(-np.clip(F_current, -20.0, 20.0)))
+        self.staged_scores_ = [_min_max_scale(prob_current).copy()]
+
+        for m in range(self.n_estimators):
+            # Pesos temporais adaptativos (prioriza concursos mais recentes)
+            half_life = 50.0 + (m * 20.0)
+            decay = 0.5 ** (1.0 / half_life)
+            time_weights = decay ** np.arange(n_concursos - 1, -1, -1)
+            time_weights /= np.sum(time_weights)
+
+            # Probabilidades atuais para cada concurso e dezena
+            p_mat = 1.0 / (1.0 + np.exp(-np.clip(F_current[None, :], -20.0, 20.0)))
+
+            # Gradiente negativo da Binomial Deviance (y - p)
+            dev_residuals = binary_matrix.astype(float) - p_mat
+
+            # 2. Passo ótimo de Newton-Raphson por dezena (Friedman 2001 Eq. 27)
+            grad_w = np.sum(dev_residuals * time_weights[:, None], axis=0)
+            hessian_w = np.sum((p_mat * (1.0 - p_mat)) * time_weights[:, None], axis=0) + 1e-5
+            gamma_m = grad_w / hessian_w
+
+            # Normalização de escala para estabilidade numérica
+            gamma_std = np.std(gamma_m)
+            if gamma_std > 1e-8:
+                gamma_step = (gamma_m - np.mean(gamma_m)) / gamma_std
+            else:
+                gamma_step = gamma_m - np.mean(gamma_m)
+
+            # 3. Atualização no espaço logit com regularização por encolhimento (Shrinkage)
+            F_current = F_current + self.learning_rate * gamma_step
+            F_current = np.clip(F_current, -20.0, 20.0)
+
+            # Probabilidade calibrada atualizada
+            prob_updated = 1.0 / (1.0 + np.exp(-F_current))
+            self.staged_scores_.append(_min_max_scale(prob_updated).copy())
+
+        final_probs = 1.0 / (1.0 + np.exp(-F_current))
+        final_scores = _min_max_scale(final_probs)
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'probabilidade_calibrada': np.round(final_probs, 5),
+            'logit_escore': np.round(F_current, 5),
+            'escore_logit_gradboost': np.round(final_scores, 5)
+        }).sort_values('escore_logit_gradboost', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo Logit Gradient Boosting.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted(self.scores_df_.head(k)['dezena'].tolist())
+
+    def staged_predict_top_k(self, k: Optional[int] = None) -> Generator[List[int], None, None]:
+        """
+        Iterador sobre as predições do ensemble em cada estágio de treinamento no espaço de probabilidade.
+        """
+        if not self.staged_scores_:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        k = k if k is not None else (len(self.top_k_) if self.top_k_ is not None else 6)
+        for s in self.staged_scores_:
+            if k <= 0:
+                yield []
+            else:
+                k_actual = min(k, len(s))
+                yield sorted(list(np.argsort(s)[::-1][:k_actual] + 1))
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores e probabilidades do Logit Gradient Boosting."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+# Alias conveniente e formal
+LotteryBinomialDevianceGradientBoostingModel = LotteryLogitGradientBoostingModel
+
+
+class LotteryResidualCyclingGradientBoostingModel:
+    """
+    Ensemble Multi-Model Residual Cycling Gradient Boosting para Seleção de Dezenas em Loterias.
+    Baseado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 7 ('Gradient Boosting')
+    e nos princípios de boosting com preditores base heterogêneos (Breiman, 1997; Friedman, 1999).
+
+    Fundamentação Teórica e Algorítmica:
+    1. Ciclagem Sequencial de Modelos Especialistas de Base:
+       Ao invés de aplicar o mesmo estimador residual uniforme em todas as rodadas, cada estágio m de boosting
+       corrige os resíduos remanescentes empregando um modelo analítico-base distinto do projeto:
+       - Estágio m mod 4 = 1: M2 Regressão Logística L2 / ML ('ml_logistic')
+         Ajusta projeção supervisionada e correlação cruzada temporal sobre o sinal residual.
+       - Estágio m mod 4 = 2: M4 Geometria do Acaso de Gianella ('gianella')
+         Compensa o déficit residual nas partições diofantinas de cores/quadrantes espaciais.
+       - Estágio m mod 4 = 3: M1 Frequência / Atraso Relativo e Gap ('delay_momentum')
+         Foca nas dezenas com atraso relativo crítico e gradiente de recuperação residual.
+       - Estágio m mod 4 = 0: M3 Bayesiano Adaptativo ('bayes_adaptive')
+         Atualiza a crença a posteriori sobre a densidade residual via conjugada Beta-Binomial adaptativa.
+    2. Correção Cumulativa com Regularização por Encolhimento (Shrinkage, Géron p. 205):
+       F_m = F_{m-1} + learning_rate * (h_norm - 0.5)
+       R^{(m)} = R^{(m-1)} - learning_rate * (h_norm - 0.5)
+    3. Diversidade Estrutural do Ensemble:
+       A alternância entre modelos estatísticos, bayesianos, geométricos e conexionistas/ML garante que
+       nenhum viés metodológico único domine o processo de boosting, capturando resíduos multifacetados.
+    """
+
+    SUPPORTED_BASE_MODELS = ('ml_logistic', 'gianella', 'delay_momentum', 'bayes_adaptive')
+
+    def __init__(self,
+                 n_estimators: int = 8,
+                 learning_rate: float = 0.4,
+                 base_cycle: Optional[List[str]] = None,
+                 random_state: int = 42):
+        """
+        Parameters
+        ----------
+        n_estimators : int
+            Número total de estágios de ciclagem residual (default 8, correspondente a 2 ciclos completos dos 4 modelos).
+        learning_rate : float
+            Taxa de aprendizado / encolhimento eta (default 0.4).
+        base_cycle : Optional[List[str]]
+            Sequência ordenada de modelos-base para ciclagem residual.
+            Padrão: ['ml_logistic', 'gianella', 'delay_momentum', 'bayes_adaptive'].
+        random_state : int
+            Semente para reprodutibilidade.
+        """
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser estritamente positivo (> 0). Recebido: {n_estimators}")
+        if learning_rate <= 0:
+            raise ValueError(f"learning_rate deve ser estritamente positivo (> 0). Recebido: {learning_rate}")
+
+        if base_cycle is None:
+            base_cycle = ['ml_logistic', 'gianella', 'delay_momentum', 'bayes_adaptive']
+        else:
+            if len(base_cycle) == 0:
+                raise ValueError("base_cycle não pode ser vazio.")
+            for mod in base_cycle:
+                if mod not in self.SUPPORTED_BASE_MODELS:
+                    raise ValueError(f"Modelo '{mod}' inválido em base_cycle. Suportados: {self.SUPPORTED_BASE_MODELS}")
+
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.base_cycle = list(base_cycle)
+        self.random_state = random_state
+
+        self.staged_scores_: List[np.ndarray] = []
+        self.stage_models_: List[str] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryResidualCyclingGradientBoostingModel':
+        """
+        Ajusta o Gradient Boosting ciclando pelos modelos base analíticos a cada estágio residual.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+
+        # 1. Modelo inicial F_0: Estimativa a priori bayesiana suavizada
+        alpha_0 = cfg.get('alpha_0', 1.0)
+        beta_0 = cfg.get('beta_0', 9.0)
+        F_current = (binary_matrix.sum(axis=0) + alpha_0) / (n_concursos + alpha_0 + beta_0)
+        F_current = _min_max_scale(F_current)
+
+        # Resíduos iniciais R^{(0)} = Y - F_0
+        residuals = binary_matrix.astype(float) - F_current[None, :]
+        self.staged_scores_ = [F_current.copy()]
+        self.stage_models_ = []
+
+        # Pré-cálculo de atrasos correntes para o modelo M1 (delay)
+        delays = np.zeros(n_dezenas, dtype=float)
+        for d in range(n_dezenas):
+            idx_drawn = np.where(binary_matrix[:, d] == 1)[0]
+            delays[d] = float(n_concursos - 1 - idx_drawn[-1]) if len(idx_drawn) > 0 else float(n_concursos)
+
+        # Divisão em quadrantes/cores de Gianella (M4)
+        group_size = cfg.get('gianella_group_size', max(1, n_dezenas // 4))
+
+        for m in range(self.n_estimators):
+            active_model = self.base_cycle[m % len(self.base_cycle)]
+            self.stage_models_.append(active_model)
+
+            half_life = 40.0 + (m * 15.0)
+            decay = 0.5 ** (1.0 / half_life)
+            time_weights = decay ** np.arange(n_concursos - 1, -1, -1)
+            time_weights /= np.sum(time_weights)
+
+            # 2. Ajuste do especialista residual de acordo com a metodologia ativa
+            if active_model == 'ml_logistic':
+                # Estágio M2: Classificador / Projeção residual cruzada
+                # Mede a autocorrelação entre sorteios passados e os resíduos presentes
+                if n_concursos >= 5:
+                    X_lag = binary_matrix[:-1, :].astype(float)
+                    R_next = residuals[1:, :]
+                    # Projeção L2-regularizada: W = (X^T X + lambda I)^{-1} X^T R
+                    cov_xx = np.dot(X_lag.T, X_lag) + 5.0 * np.eye(n_dezenas)
+                    cov_xr = np.dot(X_lag.T, R_next)
+                    last_state = binary_matrix[-1, :].astype(float)
+                    try:
+                        w_weights = np.linalg.solve(cov_xx, cov_xr)
+                        h_m = np.dot(last_state, w_weights)
+                    except Exception:
+                        h_m = np.sum(residuals * time_weights[:, None], axis=0)
+                else:
+                    h_m = np.sum(residuals * time_weights[:, None], axis=0)
+
+            elif active_model == 'gianella':
+                # Estágio M4: Geometria do Acaso / Cores de Gianella
+                # Identifica grupos de cores com déficit residual acumulado
+                raw_grad = np.sum(residuals * time_weights[:, None], axis=0)
+                h_m = raw_grad.copy()
+                n_groups = int(np.ceil(n_dezenas / group_size))
+                for g in range(n_groups):
+                    start_d = g * group_size
+                    end_d = min(n_dezenas, (g + 1) * group_size)
+                    zone_indices = np.arange(start_d, end_d)
+                    zone_residual = np.mean(raw_grad[zone_indices])
+                    # Impulsiona as dezenas de quadrantes que apresentaram déficit positivo de resíduo
+                    h_m[zone_indices] += 0.5 * zone_residual
+
+            elif active_model == 'delay_momentum':
+                # Estágio M1: Frequência e Atraso Relativo
+                # Combina o momentum residual recente com o atraso corrente (gap de recorrência)
+                raw_grad = np.sum(residuals * time_weights[:, None], axis=0)
+                delay_norm = _min_max_scale(delays)
+                # Dezenas atrasadas com gradiente residual positivo recebem forte aceleração
+                h_m = 0.6 * raw_grad + 0.4 * (raw_grad * (1.0 + delay_norm))
+
+            elif active_model == 'bayes_adaptive':
+                # Estágio M3: Decisão Bayesiana Adaptativa
+                # Atualização a posteriori conjugada sobre a energia positiva dos resíduos
+                pos_residuals = np.maximum(0.0, residuals)
+                bayes_pseudo_counts = np.sum(pos_residuals * time_weights[:, None], axis=0)
+                # Escore a posteriori Beta-Binomial suavizado
+                h_m = (bayes_pseudo_counts + alpha_0) / (np.sum(bayes_pseudo_counts) / n_dezenas + alpha_0 + beta_0)
+
+            else:
+                h_m = np.sum(residuals * time_weights[:, None], axis=0)
+
+            h_norm = _min_max_scale(h_m)
+
+            # 3. Atualização do ensemble com regularização por encolhimento (Shrinkage, Géron p. 205)
+            F_current = F_current + self.learning_rate * (h_norm - 0.5)
+            F_current = np.clip(F_current, 0.0, None)
+
+            # 4. Atualização dos resíduos para o próximo modelo especialista
+            residuals = residuals - self.learning_rate * (h_norm[None, :] - 0.5)
+            self.staged_scores_.append(_min_max_scale(F_current).copy())
+
+        final_scores = _min_max_scale(F_current)
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_cycling_gradboost': np.round(final_scores, 5),
+            'escore_acumulado': np.round(F_current, 5)
+        }).sort_values('escore_cycling_gradboost', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo Residual Cycling Gradient Boosting.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted(self.scores_df_.head(k)['dezena'].tolist())
+
+    def staged_predict_top_k(self, k: Optional[int] = None) -> Generator[List[int], None, None]:
+        """
+        Iterador sobre as predições do ensemble em cada estágio de treinamento multi-modelo.
+        """
+        if not self.staged_scores_:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        k = k if k is not None else (len(self.top_k_) if self.top_k_ is not None else 6)
+        for s in self.staged_scores_:
+            if k <= 0:
+                yield []
+            else:
+                k_actual = min(k, len(s))
+                yield sorted(list(np.argsort(s)[::-1][:k_actual] + 1))
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do Residual Cycling Gradient Boosting."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
 class LotteryStackingModel:
     """
     Ensemble Stacking (Stacked Generalization / Blending) para Seleção de Dezenas em Loterias.
@@ -2681,6 +3206,56 @@ def predict_gradient_boosting(binary_matrix: np.ndarray,
     """Predição direta das top K dezenas via Ensemble Gradient Boosting."""
     k_actual = cfg['k'] if k is None else k
     model = LotteryGradientBoostingModel(n_estimators=n_estimators, learning_rate=learning_rate, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+def predict_stochastic_gradient_boosting(binary_matrix: np.ndarray,
+                                         cfg: Dict,
+                                         k: Optional[int] = None,
+                                         n_estimators: int = 10,
+                                         learning_rate: float = 0.5,
+                                         subsample: float = 0.7,
+                                         random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Stochastic Gradient Boosting (Géron p. 207)."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryStochasticGradientBoostingModel(n_estimators=n_estimators,
+                                                   learning_rate=learning_rate,
+                                                   subsample=subsample,
+                                                   random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+def predict_logit_gradient_boosting(binary_matrix: np.ndarray,
+                                    cfg: Dict,
+                                    k: Optional[int] = None,
+                                    n_estimators: int = 10,
+                                    learning_rate: float = 0.3,
+                                    random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Logit / Binomial Deviance Gradient Boosting."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryLogitGradientBoostingModel(n_estimators=n_estimators,
+                                              learning_rate=learning_rate,
+                                              random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+predict_binomial_deviance_gradient_boosting = predict_logit_gradient_boosting
+
+
+def predict_residual_cycling_gradient_boosting(binary_matrix: np.ndarray,
+                                               cfg: Dict,
+                                               k: Optional[int] = None,
+                                               n_estimators: int = 8,
+                                               learning_rate: float = 0.4,
+                                               random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Residual Cycling Gradient Boosting."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryResidualCyclingGradientBoostingModel(n_estimators=n_estimators,
+                                                        learning_rate=learning_rate,
+                                                        random_state=random_state)
     model.fit(binary_matrix, cfg=cfg)
     return model.predict_top_k(k_actual)
 
@@ -2877,6 +3452,18 @@ def run_all_lottery_methods(filepath: str,
     m_gradboost.fit(binary_matrix, cfg=cfg)
     pred_gradboost = m_gradboost.predict_top_k(k)
 
+    m_stoch_gb = LotteryStochasticGradientBoostingModel(n_estimators=10, learning_rate=0.5, subsample=0.7, random_state=42)
+    m_stoch_gb.fit(binary_matrix, cfg=cfg)
+    pred_stoch_gb = m_stoch_gb.predict_top_k(k)
+
+    m_logit_gb = LotteryLogitGradientBoostingModel(n_estimators=10, learning_rate=0.3, random_state=42)
+    m_logit_gb.fit(binary_matrix, cfg=cfg)
+    pred_logit_gb = m_logit_gb.predict_top_k(k)
+
+    m_cycle_gb = LotteryResidualCyclingGradientBoostingModel(n_estimators=8, learning_rate=0.4, random_state=42)
+    m_cycle_gb.fit(binary_matrix, cfg=cfg)
+    pred_cycle_gb = m_cycle_gb.predict_top_k(k)
+
     m_stacking = LotteryStackingModel(holdout_ratio=0.25, random_state=42)
     m_stacking.fit(binary_matrix, cfg=cfg)
     pred_stacking = m_stacking.predict_top_k(k)
@@ -2886,6 +3473,9 @@ def run_all_lottery_methods(filepath: str,
         'Ensemble Pasting': pred_pasting,
         'Ensemble AdaBoost': pred_adaboost,
         'Ensemble Gradient Boosting': pred_gradboost,
+        'Ensemble Stochastic Gradient Boosting': pred_stoch_gb,
+        'Ensemble Logit Gradient Boosting': pred_logit_gb,
+        'Ensemble Residual Cycling Gradient Boosting': pred_cycle_gb,
         'Ensemble Stacking': pred_stacking
     }
 
@@ -2922,7 +3512,10 @@ def run_all_lottery_methods(filepath: str,
         predictions['Metodo 21 (Ensemble Pasting - Non-replacement Aggregating)'] = pred_pasting
         predictions['Metodo 22 (Ensemble AdaBoost - Adaptive Boosting)'] = pred_adaboost
         predictions['Metodo 23 (Ensemble Gradient Boosting - Residual Boosting)'] = pred_gradboost
-        predictions['Metodo 24 (Ensemble Stacking - Stacked Generalization)'] = pred_stacking
+        predictions['Metodo 24 (Ensemble Stochastic Gradient Boosting - Subsample)'] = pred_stoch_gb
+        predictions['Metodo 25 (Ensemble Logit Gradient Boosting - Binomial Deviance)'] = pred_logit_gb
+        predictions['Metodo 26 (Ensemble Residual Cycling Gradient Boosting - Multi-Model Residual)'] = pred_cycle_gb
+        predictions['Metodo 27 (Ensemble Stacking - Stacked Generalization)'] = pred_stacking
 
     comparison_records = []
     for name, nums in predictions.items():
@@ -2948,6 +3541,9 @@ def run_all_lottery_methods(filepath: str,
         'm_pasting': m_pasting,
         'm_adaboost': m_adaboost,
         'm_gradboost': m_gradboost,
+        'm_stoch_gb': m_stoch_gb,
+        'm_logit_gb': m_logit_gb,
+        'm_cycle_gb': m_cycle_gb,
         'm_stacking': m_stacking,
         'pred_consenso': pred_consenso,
         'consensus_scores': ball_scores,

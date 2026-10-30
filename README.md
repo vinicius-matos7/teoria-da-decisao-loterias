@@ -115,6 +115,16 @@ Cada notebook executa e compara **4 abordagens metodológicas**:
      * **Bayes Adaptativo + Frequência/Atraso (Momentum):** Fusão da posteriori adaptativa dinâmica com a taxa recente de sorteios.
      * **Bayes Adaptativo + Frequência/Atraso (Balanceado):** Combinação da evidência bayesiana dinâmica com o equilíbrio entre frequência e atraso.
 
+6. **Métodos Ensemble (Aurélien Géron, Cap. 7 & Jerome H. Friedman — 8 Métodos):**
+   * **Ensemble Bagging (Bootstrap Aggregating):** Gera $ réplicas com reposição (*bootstrap*) dos concursos históricos, ajustando preditores em cada partição e agregando votos via probabilidade média ou votação majoritária (*soft/hard voting*).
+   * **Ensemble Pasting (Non-replacement Aggregating):** Amostragem estocástica de concursos históricos sem reposição (*Breiman, 1999*), reduzindo a dependência e variância entre estimadores.
+   * **Ensemble AdaBoost (Adaptive Boosting):** Ajuste sequencial reponderando as instâncias históricas com base no erro de previsão de cada concurso (^{(m+1)} \propto w_i^{(m)} \exp(lpha_m e_{m, i})$), forçando o modelo a focar nos sorteios mais anômalos (*Freund & Schapire, 1997*).
+   * **Ensemble Gradient Boosting (Residual Boosting Padrão):** Correção sequencial do gradiente de resíduos ( = Y - F_{m-1}$) com regularização por encolhimento (*shrinkage* $\eta$) e decaimento temporal adaptativo (*Friedman, 1999*).
+   * **Ensemble Stochastic Gradient Boosting (Subsample Boosting):** A cada estágio de boosting, sorteia aleatoriamente uma fração subsample (ex.: 70%) dos concursos históricos para ajustar o vetor residual, reduzindo substancialmente a variância e mitigando sobreajuste (*Géron p. 207; Friedman, 2002*).
+   * **Ensemble Logit Gradient Boosting (Log-Loss / Binomial Deviance):** Opera no espaço contínuo dos logits/log-odds com link sigmoide $\sigma(z) = \frac{1}{1 + e^{-z}}$ e resíduo como o gradiente negativo da perda de entropia cruzada binária ( - \sigma(F)$) via passos de Newton-Raphson calibrados (*Friedman, 2001*).
+   * **Ensemble Multi-Model Residual Cycling Gradient Boosting:** Gradient Boosting com preditores heterogêneos onde cada estágio de boosting corrige os resíduos empregando ciclicamente um paradigma analítico distinto do projeto (M2 ML Projeção Residual $\rightarrow$ M4 Gianella Cores $\rightarrow$ M1 Delay/Gap Momentum $\rightarrow$ M3 Bayesiano Adaptativo).
+   * **Ensemble Stacking (Stacked Generalization / Blender Ridge L2):** Arquitetura em camadas (*layered ensemble*) que divide a base em treino e *holdout*, gerando matriz de meta-features e calibrando um meta-aprendiz Ridge $ para encontrar a combinação convexa ótima (*Wolpert, 1992; Géron p. 208-210*).
+
 ---
 
 ## 📁 Estrutura do Repositório
@@ -171,3 +181,9 @@ pytest tests/
 * IZBICKI, Rafael; SANTOS, Tiago Mendonça dos. *Aprendizado de máquina: uma abordagem estatística*. 1. ed. 2020.
 * DEGROOT, Morris H. *Optimal Statistical Decisions*. John Wiley & Sons, 1970.
 * GIANELLA, Renato. *The Geometry of Chance: Lotto Numbers Patterns*. 2013.
+* GÉRON, Aurélien. *Hands-On Machine Learning with Scikit-Learn, Keras, and TensorFlow*. 2. ed. O'Reilly, 2019. Capítulo 7: *Ensemble Learning and Random Forests*.
+* FRIEDMAN, Jerome H. *Greedy Function Approximation: A Gradient Boosting Machine*. The Annals of Statistics, v. 29, n. 5, p. 1189–1232, 2001.
+* FRIEDMAN, Jerome H. *Stochastic Gradient Boosting*. Computational Statistics & Data Analysis, v. 38, n. 4, p. 367–378, 2002.
+* BREIMAN, Leo. *Bagging Predictors*. Machine Learning, v. 24, n. 2, p. 123–140, 1996.
+* BREIMAN, Leo. *Pasting Small Votes for Classification in Large Databases and On-Line*. Machine Learning, v. 36, p. 85–103, 1999.
+* WOLPERT, David H. *Stacked Generalization*. Neural Networks, v. 5, n. 2, p. 241–259, 1992.
