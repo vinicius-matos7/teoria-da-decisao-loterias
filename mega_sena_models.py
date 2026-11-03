@@ -3170,6 +3170,287 @@ class LotteryStackingModel:
             raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
         return self.scores_df_.copy()
 
+class LotteryMomentumEnsembleModel:
+    """
+    Ensemble Frequência/Atraso (Momentum Multi-Janela com Bootstrap).
+
+    Fundamentação Teórica:
+    - O modelo tradicional de momentum avalia a frequência recente através do decaimento temporal
+      exponencial w_t = 2^(-(T - t) / lambda).
+    - Fixar uma única meia-vida lambda (ex: 100 sorteios) impõe uma escala temporal estática,
+      podendo perder acelerações de curtíssimo prazo ou superestimar ruído efêmero.
+    - Este Ensemble constrói um comitê heterogêneo de estimadores de momentum combinando:
+      1. Escalas temporais múltiplas (multi-scale half-life):
+         lambda in [15, 30, 50, 80, 120, 180, 250] (curto, médio e longo prazo).
+      2. Amostragem Bootstrap com reposição dos concursos históricos (Breiman 1996; Géron Cap. 7),
+         reduzindo a variância das frequências ponderadas.
+      3. Agregação por Votação Suave (Soft Voting) com normalização dos escores de momentum.
+      4. Avaliação Out-of-Bag (OOB) para validação do comitê.
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 half_lives: Optional[List[float]] = None,
+                 max_samples: float = 1.0,
+                 voting: str = 'soft',
+                 oob_score: bool = True,
+                 random_state: int = 42):
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser positivo. Recebido: {n_estimators}")
+        if not (0.0 < max_samples <= 1.0):
+            raise ValueError(f"max_samples deve estar no intervalo (0, 1]. Recebido: {max_samples}")
+
+        self.n_estimators = n_estimators
+        self.half_lives = half_lives or [15.0, 30.0, 50.0, 80.0, 120.0, 180.0, 250.0]
+        self.max_samples = max_samples
+        self.voting = voting
+        self.oob_score = oob_score
+        self.random_state = random_state
+
+        self.estimators_: List[Dict[str, Any]] = []
+        self.oob_score_: float = 0.0
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryMomentumEnsembleModel':
+        """
+        Ajusta o ensemble de momentum multi-janela com amostragem bootstrap.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+        rng = np.random.RandomState(self.random_state)
+        m_samples = max(1, int(self.max_samples * n_concursos))
+
+        self.estimators_ = []
+        all_scores: List[np.ndarray] = []
+        all_top_k: List[List[int]] = []
+        oob_hits_total = 0
+        oob_eval_count = 0
+
+        for b in range(self.n_estimators):
+            hl = self.half_lives[b % len(self.half_lives)]
+            boot_idx = np.sort(rng.choice(n_concursos, size=m_samples, replace=True))
+            oob_idx = np.setdiff1d(np.arange(n_concursos), boot_idx)
+            X_b = binary_matrix[boot_idx]
+
+            # Frequência ponderada temporalmente para a meia-vida hl
+            decay = 0.5 ** (1.0 / hl)
+            time_weights = decay ** np.arange(len(boot_idx) - 1, -1, -1)
+            sum_w = np.sum(time_weights)
+            w_freq = np.sum(X_b * time_weights[:, None], axis=0) / (sum_w if sum_w > 0 else 1.0)
+
+            # Normalização (Z-score e Min-Max)
+            std_f = np.std(w_freq)
+            z_f = (w_freq - np.mean(w_freq)) / (std_f if std_f > 0 else 1.0)
+            score_b = (z_f - np.min(z_f)) / (np.ptp(z_f) if np.ptp(z_f) > 0 else 1.0)
+            all_scores.append(score_b)
+
+            top_b = sorted(list(np.argsort(score_b)[::-1][:k] + 1))
+            all_top_k.append(top_b)
+            self.estimators_.append({
+                'estimator_idx': b,
+                'half_life': hl,
+                'scores': score_b,
+                'top_k': top_b,
+                'n_oob': len(oob_idx)
+            })
+
+            # Avaliação Out-of-Bag (OOB)
+            if self.oob_score and len(oob_idx) > 0:
+                top_b_set = set(top_b)
+                for idx_oob in oob_idx:
+                    drawn = set(np.where(binary_matrix[idx_oob] == 1)[0] + 1)
+                    oob_hits_total += len(top_b_set & drawn)
+                    oob_eval_count += 1
+
+        self.oob_score_ = float(oob_hits_total / oob_eval_count) if oob_eval_count > 0 else 0.0
+
+        soft_scores = np.mean(all_scores, axis=0)
+        hard_votes = np.zeros(n_dezenas, dtype=float)
+        for top_b in all_top_k:
+            for dez in top_b:
+                hard_votes[dez - 1] += 1.0
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_momentum_ensemble': np.round(soft_scores, 5),
+            'votos_hard': hard_votes.astype(int)
+        }).sort_values('escore_momentum_ensemble', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None, voting: Optional[str] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo ensemble de Momentum.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+
+        use_voting = voting or self.voting
+        if use_voting == 'hard':
+            df_sorted = self.scores_df_.sort_values(['votos_hard', 'escore_momentum_ensemble'], ascending=[False, False])
+        else:
+            df_sorted = self.scores_df_.sort_values('escore_momentum_ensemble', ascending=False)
+        return sorted(df_sorted.head(k)['dezena'].tolist())
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do Momentum Ensemble."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+class LotteryBalancedEnsembleModel:
+    """
+    Ensemble Frequência/Atraso (Balanceado Multi-Escala com Bootstrap).
+
+    Fundamentação Teórica:
+    - O modelo estatístico balanceado (Método 1) combina a frequência ponderada recente z_freq
+      com a pressão do atraso relativo z_delay:
+      Score_i = alpha * Z(f_w, i) + (1 - alpha) * Z(R_i)
+    - Fixar arbitrariamente alpha = 0.5 e lambda = 100 impõe rigidez na ponderação entre momentum e reversão.
+    - Este Ensemble constrói um comitê sistemático variando:
+      1. Os fatores de equilíbrio alpha: [0.25, 0.35, 0.50, 0.65, 0.75]
+         (alternando entre ênfase em atraso, neutralidade e ênfase em momentum).
+      2. As meias-vidas de decaimento temporal lambda: [30, 60, 100, 150, 250].
+      3. Amostragem Bootstrap com reposição dos concursos históricos (Breiman 1996; Géron Cap. 7).
+      4. Agregação por Votação Suave (Soft Voting) dos escores compostos normalizados.
+      5. Avaliação Out-of-Bag (OOB) dos acertos.
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 alphas: Optional[List[float]] = None,
+                 half_lives: Optional[List[float]] = None,
+                 max_samples: float = 1.0,
+                 voting: str = 'soft',
+                 oob_score: bool = True,
+                 random_state: int = 42):
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser positivo. Recebido: {n_estimators}")
+        if not (0.0 < max_samples <= 1.0):
+            raise ValueError(f"max_samples deve estar no intervalo (0, 1]. Recebido: {max_samples}")
+
+        self.n_estimators = n_estimators
+        self.alphas = alphas or [0.25, 0.35, 0.50, 0.65, 0.75]
+        self.half_lives = half_lives or [30.0, 60.0, 100.0, 150.0, 250.0]
+        self.max_samples = max_samples
+        self.voting = voting
+        self.oob_score = oob_score
+        self.random_state = random_state
+
+        self.estimators_: List[Dict[str, Any]] = []
+        self.oob_score_: float = 0.0
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryBalancedEnsembleModel':
+        """
+        Ajusta o ensemble balanceado multi-escala com amostragem bootstrap.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+        rng = np.random.RandomState(self.random_state)
+        m_samples = max(1, int(self.max_samples * n_concursos))
+
+        self.estimators_ = []
+        all_scores: List[np.ndarray] = []
+        all_top_k: List[List[int]] = []
+        oob_hits_total = 0
+        oob_eval_count = 0
+
+        for b in range(self.n_estimators):
+            alpha_b = self.alphas[b % len(self.alphas)]
+            hl_b = self.half_lives[b % len(self.half_lives)]
+            boot_idx = np.sort(rng.choice(n_concursos, size=m_samples, replace=True))
+            oob_idx = np.setdiff1d(np.arange(n_concursos), boot_idx)
+            X_b = binary_matrix[boot_idx]
+
+            m = FrequencyDelayModel(half_life=hl_b, alpha=alpha_b).fit(X_b)
+            s_raw = np.zeros(n_dezenas, dtype=float)
+            for _, r in m.scores_df_.iterrows():
+                s_raw[int(r['dezena']) - 1] = float(r['escore_composto'])
+
+            # Normalização min-max
+            score_b = (s_raw - np.min(s_raw)) / (np.ptp(s_raw) if np.ptp(s_raw) > 0 else 1.0)
+            all_scores.append(score_b)
+
+            top_b = sorted(list(np.argsort(score_b)[::-1][:k] + 1))
+            all_top_k.append(top_b)
+            self.estimators_.append({
+                'estimator_idx': b,
+                'alpha': alpha_b,
+                'half_life': hl_b,
+                'scores': score_b,
+                'top_k': top_b,
+                'n_oob': len(oob_idx)
+            })
+
+            # Avaliação Out-of-Bag (OOB)
+            if self.oob_score and len(oob_idx) > 0:
+                top_b_set = set(top_b)
+                for idx_oob in oob_idx:
+                    drawn = set(np.where(binary_matrix[idx_oob] == 1)[0] + 1)
+                    oob_hits_total += len(top_b_set & drawn)
+                    oob_eval_count += 1
+
+        self.oob_score_ = float(oob_hits_total / oob_eval_count) if oob_eval_count > 0 else 0.0
+
+        soft_scores = np.mean(all_scores, axis=0)
+        hard_votes = np.zeros(n_dezenas, dtype=float)
+        for top_b in all_top_k:
+            for dez in top_b:
+                hard_votes[dez - 1] += 1.0
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_balanceado_ensemble': np.round(soft_scores, 5),
+            'votos_hard': hard_votes.astype(int)
+        }).sort_values('escore_balanceado_ensemble', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None, voting: Optional[str] = None) -> List[int]:
+        """
+        Retorna as top K dezenas selecionadas pelo ensemble Balanceado.
+        """
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+
+        use_voting = voting or self.voting
+        if use_voting == 'hard':
+            df_sorted = self.scores_df_.sort_values(['votos_hard', 'escore_balanceado_ensemble'], ascending=[False, False])
+        else:
+            df_sorted = self.scores_df_.sort_values('escore_balanceado_ensemble', ascending=False)
+        return sorted(df_sorted.head(k)['dezena'].tolist())
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com escores do Balanced Ensemble."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
 
 
 def predict_bagging(binary_matrix: np.ndarray,
@@ -3290,6 +3571,32 @@ def predict_stacking(binary_matrix: np.ndarray,
                                  alpha=alpha, random_state=random_state)
     model.fit(binary_matrix, cfg=cfg)
     return model.predict_top_k(k_actual)
+
+def predict_momentum_ensemble(binary_matrix: np.ndarray,
+                              cfg: Dict,
+                              k: Optional[int] = None,
+                              n_estimators: int = 10,
+                              voting: str = 'soft',
+                              random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Frequência/Atraso Momentum."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryMomentumEnsembleModel(n_estimators=n_estimators, voting=voting, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+def predict_balanced_ensemble(binary_matrix: np.ndarray,
+                              cfg: Dict,
+                              k: Optional[int] = None,
+                              n_estimators: int = 10,
+                              voting: str = 'soft',
+                              random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Frequência/Atraso Balanceado."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryBalancedEnsembleModel(n_estimators=n_estimators, voting=voting, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
 
 
 # ==============================================================================
@@ -3468,6 +3775,14 @@ def run_all_lottery_methods(filepath: str,
     m_stacking.fit(binary_matrix, cfg=cfg)
     pred_stacking = m_stacking.predict_top_k(k)
 
+    m_mom_ens = LotteryMomentumEnsembleModel(n_estimators=10, random_state=42)
+    m_mom_ens.fit(binary_matrix, cfg=cfg)
+    pred_mom_ens = m_mom_ens.predict_top_k(k)
+
+    m_bal_ens = LotteryBalancedEnsembleModel(n_estimators=10, random_state=42)
+    m_bal_ens.fit(binary_matrix, cfg=cfg)
+    pred_bal_ens = m_bal_ens.predict_top_k(k)
+
     predictions_ensemble = {
         'Ensemble Bagging': pred_bagging,
         'Ensemble Pasting': pred_pasting,
@@ -3476,7 +3791,9 @@ def run_all_lottery_methods(filepath: str,
         'Ensemble Stochastic Gradient Boosting': pred_stoch_gb,
         'Ensemble Logit Gradient Boosting': pred_logit_gb,
         'Ensemble Residual Cycling Gradient Boosting': pred_cycle_gb,
-        'Ensemble Stacking': pred_stacking
+        'Ensemble Stacking': pred_stacking,
+        'Ensemble Frequência/Atraso Momentum': pred_mom_ens,
+        'Ensemble Frequência/Atraso Balanceado': pred_bal_ens
     }
 
     predictions = {
@@ -3516,6 +3833,8 @@ def run_all_lottery_methods(filepath: str,
         predictions['Metodo 25 (Ensemble Logit Gradient Boosting - Binomial Deviance)'] = pred_logit_gb
         predictions['Metodo 26 (Ensemble Residual Cycling Gradient Boosting - Multi-Model Residual)'] = pred_cycle_gb
         predictions['Metodo 27 (Ensemble Stacking - Stacked Generalization)'] = pred_stacking
+        predictions['Metodo 28 (Ensemble Frequencia/Atraso Momentum - Multi-Janela)'] = pred_mom_ens
+        predictions['Metodo 29 (Ensemble Frequencia/Atraso Balanceado - Multi-Escala)'] = pred_bal_ens
 
     comparison_records = []
     for name, nums in predictions.items():
@@ -3545,6 +3864,8 @@ def run_all_lottery_methods(filepath: str,
         'm_logit_gb': m_logit_gb,
         'm_cycle_gb': m_cycle_gb,
         'm_stacking': m_stacking,
+        'm_mom_ens': m_mom_ens,
+        'm_bal_ens': m_bal_ens,
         'pred_consenso': pred_consenso,
         'consensus_scores': ball_scores,
         'predictions': predictions,

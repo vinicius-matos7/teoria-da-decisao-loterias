@@ -522,7 +522,9 @@ class TestEdgeCasesAndRobustness:
             'Ensemble Stochastic Gradient Boosting',
             'Ensemble Logit Gradient Boosting',
             'Ensemble Residual Cycling Gradient Boosting',
-            'Ensemble Stacking'
+            'Ensemble Stacking',
+            'Ensemble Frequência/Atraso Momentum',
+            'Ensemble Frequência/Atraso Balanceado'
         ]
         monitor.run_walk_forward(n_contests=2, models_to_run=ensemble_models, verbose=False)
 
