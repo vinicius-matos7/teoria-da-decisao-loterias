@@ -2803,7 +2803,113 @@ class LotteryLogitGradientBoostingModel:
 
 
 # Alias conveniente e formal
+# Alias conveniente e formal
 LotteryBinomialDevianceGradientBoostingModel = LotteryLogitGradientBoostingModel
+
+
+class LotteryBaggedLogitGBEnsembleModel:
+    """
+    Meta-Ensemble Bagged Logit Gradient Boosting (Ensemble do Ensemble Logit GB).
+    Baseado em Leo Breiman (1996), 'Bagging Predictors' e Jerome H. Friedman (2001, 2002),
+    'Stochastic Gradient Boosting'.
+
+    Fundamentação Matemática e Redução de Variância:
+    O modelo base LotteryLogitGradientBoostingModel é eficiente na redução de viés através
+    da minimização da Binomial Deviance no espaço de logits. No entanto, em sistemas estocásticos
+    como loterias, estimadores sequenciais isolados podem sofrer de variância estocástica
+    não-desprezível.
+
+    Este Meta-Ensemble treina um comitê de M estimadores Logit Gradient Boosting independentes,
+    cada um submetido a:
+    1. Bootstrap Subsampling Temporal: Amostragem estocástica com reposição de concursos.
+    2. Perturbação Estocástica de Taxa de Aprendizado: Variabilidade em eta ~ Uniform(0.20, 0.45).
+    3. Soft-Voting / Média de Probabilidades Calibradas:
+       p_meta(d) = (1 / M) * sum_{m=1}^M p_m(d)
+       Var(bar{p}) = rho * sigma^2 + ((1 - rho) / M) * sigma^2 -> Redução assintótica da variância!
+    """
+
+    def __init__(self,
+                 n_estimators: int = 10,
+                 base_n_iterations: int = 10,
+                 subsample: float = 0.85,
+                 learning_rate_range: Tuple[float, float] = (0.20, 0.45),
+                 random_state: int = 42):
+        if n_estimators <= 0:
+            raise ValueError(f"n_estimators deve ser > 0. Recebido: {n_estimators}")
+        self.n_estimators = n_estimators
+        self.base_n_iterations = base_n_iterations
+        self.subsample = subsample
+        self.learning_rate_range = learning_rate_range
+        self.random_state = random_state
+
+        self.sub_models_: List[LotteryLogitGradientBoostingModel] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None) -> 'LotteryBaggedLogitGBEnsembleModel':
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = cfg.get('k', 6)
+        rng = np.random.RandomState(self.random_state)
+        sample_size = max(10, int(n_concursos * self.subsample))
+
+        self.sub_models_ = []
+        all_probs = []
+
+        lr_min, lr_max = self.learning_rate_range
+
+        for i in range(self.n_estimators):
+            boot_idx = rng.choice(n_concursos, size=sample_size, replace=True)
+            boot_idx = np.sort(boot_idx)
+            sub_X = binary_matrix[boot_idx, :]
+
+            sub_lr = float(rng.uniform(lr_min, lr_max))
+            sub_seed = int(rng.randint(0, 100000))
+
+            sub_model = LotteryLogitGradientBoostingModel(
+                n_estimators=self.base_n_iterations,
+                learning_rate=sub_lr,
+                random_state=sub_seed
+            )
+            sub_model.fit(sub_X, cfg=cfg)
+            self.sub_models_.append(sub_model)
+
+            probs = sub_model.scores_df_.sort_values('dezena')['probabilidade_calibrada'].values
+            all_probs.append(probs)
+
+        avg_probs = np.mean(all_probs, axis=0)
+        final_scores = _min_max_scale(avg_probs)
+        dezenas = np.arange(1, n_dezenas + 1)
+
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'probabilidade_calibrada': np.round(avg_probs, 5),
+            'escore_meta_logit_gb': np.round(final_scores, 5)
+        }).sort_values('escore_meta_logit_gb', ascending=False).reset_index(drop=True)
+
+        self.top_k_ = sorted(self.scores_df_.head(k)['dezena'].tolist())
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted(self.scores_df_.head(k)['dezena'].tolist())
+
+    def get_scores_df(self) -> pd.DataFrame:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+LotteryMetaLogitGradientBoostingModel = LotteryBaggedLogitGBEnsembleModel
 
 
 class LotteryResidualCyclingGradientBoostingModel:
@@ -3939,6 +4045,26 @@ def predict_logit_gradient_boosting(binary_matrix: np.ndarray,
 predict_binomial_deviance_gradient_boosting = predict_logit_gradient_boosting
 
 
+def predict_bagged_logit_gb_ensemble(binary_matrix: np.ndarray,
+                                     cfg: Dict,
+                                     k: Optional[int] = None,
+                                     n_estimators: int = 10,
+                                     base_n_iterations: int = 10,
+                                     subsample: float = 0.85,
+                                     random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Meta-Ensemble Bagged Logit Gradient Boosting."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryBaggedLogitGBEnsembleModel(
+        n_estimators=n_estimators,
+        base_n_iterations=base_n_iterations,
+        subsample=subsample,
+        random_state=random_state
+    )
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+
 def predict_residual_cycling_gradient_boosting(binary_matrix: np.ndarray,
                                                cfg: Dict,
                                                k: Optional[int] = None,
@@ -4256,6 +4382,10 @@ def run_all_lottery_methods(filepath: str,
     m_stoch_gd.fit(binary_matrix, cfg=cfg)
     pred_stoch_gd = m_stoch_gd.predict_top_k(k)
 
+    m_bagged_logit_gb = LotteryBaggedLogitGBEnsembleModel(n_estimators=10, random_state=42)
+    m_bagged_logit_gb.fit(binary_matrix, cfg=cfg)
+    pred_bagged_logit_gb = m_bagged_logit_gb.predict_top_k(k)
+
     predictions_ensemble = {
         'Ensemble Bagging': pred_bagging,
         'Ensemble Pasting': pred_pasting,
@@ -4269,7 +4399,8 @@ def run_all_lottery_methods(filepath: str,
         'Ensemble Frequência/Atraso Balanceado': pred_bal_ens,
         'Ensemble Batch Gradient Descent': pred_batch_gd,
         'Ensemble Mini-Batch Gradient Descent': pred_minibatch_gd,
-        'Ensemble Stochastic Gradient Descent': pred_stoch_gd
+        'Ensemble Stochastic Gradient Descent': pred_stoch_gd,
+        'Ensemble Bagged Logit Gradient Boosting': pred_bagged_logit_gb
     }
 
     predictions = {
@@ -4314,6 +4445,7 @@ def run_all_lottery_methods(filepath: str,
         predictions['Metodo 30 (Ensemble Batch Gradient Descent - Full Batch GD)'] = pred_batch_gd
         predictions['Metodo 31 (Ensemble Mini-Batch Gradient Descent - Mini-Batch GD)'] = pred_minibatch_gd
         predictions['Metodo 32 (Ensemble Stochastic Gradient Descent - Online SGD)'] = pred_stoch_gd
+        predictions['Metodo 33 (Ensemble Bagged Logit Gradient Boosting - Meta-Ensemble)'] = pred_bagged_logit_gb
 
     comparison_records = []
     for name, nums in predictions.items():
@@ -4348,6 +4480,7 @@ def run_all_lottery_methods(filepath: str,
         'm_batch_gd': m_batch_gd,
         'm_minibatch_gd': m_minibatch_gd,
         'm_stoch_gd': m_stoch_gd,
+        'm_bagged_logit_gb': m_bagged_logit_gb,
         'pred_consenso': pred_consenso,
         'consensus_scores': ball_scores,
         'predictions': predictions,
