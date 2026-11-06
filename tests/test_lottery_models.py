@@ -30,6 +30,12 @@ from mega_sena_models import (
     LotteryStackingModel,
     LotteryMomentumEnsembleModel,
     LotteryBalancedEnsembleModel,
+    LotteryBatchGDEnsembleModel,
+    LotteryMiniBatchGDEnsembleModel,
+    LotteryStochasticGDEnsembleModel,
+    predict_batch_gd_ensemble,
+    predict_minibatch_gd_ensemble,
+    predict_stochastic_gd_ensemble,
     predict_gianella_bayes_global,
     predict_gianella_bayes_adaptive,
     predict_gianella_best_bayes_decision,
@@ -617,6 +623,66 @@ class TestModelsExecution:
             LotteryBalancedEnsembleModel().fit(np.zeros((0, 60)))
 
 
+    def test_lottery_batch_gd_ensemble_model(self, synthetic_data):
+        cfg = {'k': 6, 'n_dezenas': 60}
+        m_bgd = LotteryBatchGDEnsembleModel(n_epochs=20, learning_rate=0.1, random_state=42)
+        m_bgd.fit(synthetic_data, cfg=cfg)
+
+        top6 = m_bgd.predict_top_k(6)
+        assert len(top6) == 6
+        assert len(set(top6)) == 6
+        assert all(1 <= d <= 60 for d in top6)
+
+        scores_df = m_bgd.get_scores_df()
+        assert len(scores_df) == 60
+        assert 'escore_batch_gd' in scores_df.columns
+        assert len(m_bgd.loss_history_) == 20
+
+        assert len(m_bgd.predict_top_k(0)) == 0
+        assert len(m_bgd.predict_top_k(70)) == 60
+        with pytest.raises(ValueError):
+            LotteryBatchGDEnsembleModel().fit(np.zeros((0, 60)))
+
+    def test_lottery_minibatch_gd_ensemble_model(self, synthetic_data):
+        cfg = {'k': 6, 'n_dezenas': 60}
+        m_mbgd = LotteryMiniBatchGDEnsembleModel(n_epochs=15, batch_size=16, learning_rate=0.05, random_state=42)
+        m_mbgd.fit(synthetic_data, cfg=cfg)
+
+        top6 = m_mbgd.predict_top_k(6)
+        assert len(top6) == 6
+        assert len(set(top6)) == 6
+        assert all(1 <= d <= 60 for d in top6)
+
+        scores_df = m_mbgd.get_scores_df()
+        assert len(scores_df) == 60
+        assert 'escore_minibatch_gd' in scores_df.columns
+        assert len(m_mbgd.loss_history_) == 15
+
+        assert len(m_mbgd.predict_top_k(0)) == 0
+        assert len(m_mbgd.predict_top_k(70)) == 60
+        with pytest.raises(ValueError):
+            LotteryMiniBatchGDEnsembleModel().fit(np.zeros((0, 60)))
+
+    def test_lottery_stochastic_gd_ensemble_model(self, synthetic_data):
+        cfg = {'k': 6, 'n_dezenas': 60}
+        m_sgd = LotteryStochasticGDEnsembleModel(n_epochs=10, learning_rate_0=0.05, random_state=42)
+        m_sgd.fit(synthetic_data, cfg=cfg)
+
+        top6 = m_sgd.predict_top_k(6)
+        assert len(top6) == 6
+        assert len(set(top6)) == 6
+        assert all(1 <= d <= 60 for d in top6)
+
+        scores_df = m_sgd.get_scores_df()
+        assert len(scores_df) == 60
+        assert 'escore_stochastic_gd' in scores_df.columns
+        assert len(m_sgd.loss_history_) == 10
+
+        assert len(m_sgd.predict_top_k(0)) == 0
+        assert len(m_sgd.predict_top_k(70)) == 60
+        with pytest.raises(ValueError):
+            LotteryStochasticGDEnsembleModel().fit(np.zeros((0, 60)))
+
     def test_ensemble_helper_functions(self, synthetic_data):
         cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
         p_bag = predict_bagging(synthetic_data, cfg, k=6, n_estimators=3)
@@ -630,11 +696,15 @@ class TestModelsExecution:
         p_stack = predict_stacking(synthetic_data, cfg, k=6)
         p_mom_ens = predict_momentum_ensemble(synthetic_data, cfg, k=6, n_estimators=3)
         p_bal_ens = predict_balanced_ensemble(synthetic_data, cfg, k=6, n_estimators=3)
+        p_batch_gd = predict_batch_gd_ensemble(synthetic_data, cfg, k=6, n_epochs=10)
+        p_minibatch_gd = predict_minibatch_gd_ensemble(synthetic_data, cfg, k=6, n_epochs=10, batch_size=16)
+        p_stoch_gd = predict_stochastic_gd_ensemble(synthetic_data, cfg, k=6, n_epochs=5)
 
         for name, bet in [('bagging', p_bag), ('pasting', p_paste), ('adaboost', p_ada),
                           ('gradboost', p_gb), ('stoch_gb', p_sgb), ('logit_gb', p_lgb),
                           ('binomial_deviance_gb', p_bdgb), ('residual_cycling_gb', p_rcgb),
-                          ('stacking', p_stack), ('momentum_ensemble', p_mom_ens), ('balanced_ensemble', p_bal_ens)]:
+                          ('stacking', p_stack), ('momentum_ensemble', p_mom_ens), ('balanced_ensemble', p_bal_ens),
+                          ('batch_gd', p_batch_gd), ('minibatch_gd', p_minibatch_gd), ('stochastic_gd', p_stoch_gd)]:
             assert len(bet) == 6, f"Tamanho incorreto para {name}"
             assert len(set(bet)) == 6, f"Dezenas repetidas em {name}"
             assert all(1 <= d <= 60 for d in bet), f"Dezenas fora da faixa em {name}"
@@ -680,6 +750,7 @@ class TestRunAllLotteryMethods:
         required_keys = ['df_raw', 'binary_matrix', 'cfg', 'm1_model', 'm2_model',
                          'm3_static', 'm3_dyn', 'm4_gianella', 'm_bagging', 'm_pasting', 'm_adaboost',
                          'm_gradboost', 'm_stoch_gb', 'm_logit_gb', 'm_cycle_gb', 'm_stacking', 'm_mom_ens', 'm_bal_ens',
+                         'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd',
                          'predictions', 'predictions_ensemble', 'comparison_df']
         for k in required_keys:
             assert k in results, f"Chave {k} ausente em results"
@@ -688,7 +759,7 @@ class TestRunAllLotteryMethods:
         assert results['cfg']['n_dezenas'] == expected_n
         assert len(results['predictions']) == 7
         assert len(results['comparison_df']) == 7
-        assert len(results['predictions_ensemble']) == 10
+        assert len(results['predictions_ensemble']) == 13
         
         for name, bet in results['predictions'].items():
             assert len(bet) == expected_k, f"Tamanho incorreto para {name}: {len(bet)} != {expected_k}"
@@ -715,15 +786,16 @@ class TestRunAllLotteryMethods:
         required_keys = ['df_raw', 'binary_matrix', 'cfg', 'm1_model', 'm2_model',
                          'm3_static', 'm3_dyn', 'm4_gianella', 'm_hybrid', 'm_bagging', 'm_pasting',
                          'm_adaboost', 'm_gradboost', 'm_stoch_gb', 'm_logit_gb', 'm_cycle_gb', 'm_stacking', 'm_mom_ens', 'm_bal_ens',
+                         'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd',
                          'pred_consenso', 'consensus_scores', 'predictions', 'predictions_hybrid',
                          'predictions_ensemble', 'comparison_df']
         for k in required_keys:
             assert k in results, f"Chave {k} ausente em results"
 
-        assert len(results['predictions']) == 33
-        assert len(results['comparison_df']) == 33
+        assert len(results['predictions']) == 36
+        assert len(results['comparison_df']) == 36
         assert len(results['predictions_hybrid']) == 15
-        assert len(results['predictions_ensemble']) == 10
+        assert len(results['predictions_ensemble']) == 13
 
         for name, bet in results['predictions'].items():
             assert len(bet) == expected_k, f"Tamanho incorreto para {name}: {len(bet)} != {expected_k}"

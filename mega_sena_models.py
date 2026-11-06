@@ -3450,6 +3450,419 @@ class LotteryBalancedEnsembleModel:
             raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
         return self.scores_df_.copy()
 
+def _extract_gd_analytical_features(X_hist: np.ndarray, cfg: Dict) -> np.ndarray:
+    """
+    Extrai a matriz completa de 33 atributos analíticos derivados dos modelos
+    estatísticos, bayesianos, geométricos e heurísticos anteriores para alimentar
+    os ensembles de Gradiente Descendente (Batch, Mini-Batch e Estocástico).
+    Retorna uma matriz de shape (n_dezenas, 33) normalizada no intervalo [0, 1].
+    """
+    T_curr, N_curr = X_hist.shape
+    feats = []
+    
+    # 1-7: Multi-scale momentum (half-lives 15, 30, 50, 80, 120, 180, 250)
+    for hl in [15.0, 30.0, 50.0, 80.0, 120.0, 180.0, 250.0]:
+        decay = 0.5 ** (1.0 / hl)
+        w = decay ** np.arange(T_curr - 1, -1, -1)
+        sw = np.sum(w)
+        s = np.sum(X_hist * w[:, None], axis=0) / (sw if sw > 0 else 1.0)
+        feats.append(_min_max_scale(s))
+        
+    # 8-9: Overdue / Delays
+    delays = np.zeros(N_curr, dtype=float)
+    mean_delays = np.zeros(N_curr, dtype=float)
+    for j in range(N_curr):
+        idx = np.where(X_hist[:, j] == 1)[0]
+        if len(idx) > 0:
+            delays[j] = (T_curr - 1) - idx[-1]
+            diffs = np.diff(idx)
+            mean_delays[j] = np.mean(diffs) if len(diffs) > 0 else (T_curr / len(idx))
+        else:
+            delays[j] = T_curr
+            mean_delays[j] = T_curr
+    ratio_delay = delays / np.where(mean_delays > 0, mean_delays, 1.0)
+    feats.append(_min_max_scale(delays))
+    feats.append(_min_max_scale(ratio_delay))
+    
+    # 10-14: Balanced multi-alpha
+    mom_std = feats[2] # hl=50
+    over_std = feats[8]
+    for alpha in [0.25, 0.35, 0.50, 0.65, 0.75]:
+        b_score = alpha * mom_std + (1.0 - alpha) * over_std
+        feats.append(_min_max_scale(b_score))
+        
+    # 15: Bayes Global
+    a0 = cfg.get('alpha_0', 1.0)
+    b0 = cfg.get('beta_0', 9.0)
+    p_global = (X_hist.sum(axis=0) + a0) / (T_curr + a0 + b0)
+    feats.append(_min_max_scale(p_global))
+    
+    # 16-17: Bayes Adaptive (decay 100, 150)
+    for hl in [100.0, 150.0]:
+        decay = 0.5 ** (1.0 / hl)
+        w = decay ** np.arange(T_curr - 1, -1, -1)
+        eff_n = np.sum(w)
+        eff_s = np.sum(X_hist * w[:, None], axis=0)
+        p_dyn = (eff_s + a0) / (eff_n + a0 + b0)
+        feats.append(_min_max_scale(p_dyn))
+        
+    # 18-20: Gianella group distributions & template affinity
+    grp_sz = cfg.get('gianella_group_size', 10)
+    grp_counts = np.zeros(N_curr, dtype=float)
+    for j in range(N_curr):
+        grp_idx = (j // grp_sz)
+        grp_start = grp_idx * grp_sz
+        grp_end = min(N_curr, grp_start + grp_sz)
+        grp_counts[j] = np.sum(X_hist[:, grp_start:grp_end])
+    feats.append(_min_max_scale(grp_counts))
+    rec_grp = np.sum(X_hist[-min(10, T_curr):, :], axis=0)
+    feats.append(_min_max_scale(rec_grp))
+    feats.append(_min_max_scale(rec_grp / np.where(grp_counts > 0, grp_counts, 1.0)))
+    
+    # 21-24: Moving Averages (Lags 5, 10, 25, 50)
+    for win in [5, 10, 25, 50]:
+        w_act = min(win, T_curr)
+        ma = np.mean(X_hist[-w_act:, :], axis=0)
+        feats.append(_min_max_scale(ma))
+        
+    # 25-28: Hybrids / Cross Interactions
+    feats.append(_min_max_scale(feats[14] * feats[17]))
+    feats.append(_min_max_scale(feats[14] * feats[2]))
+    feats.append(_min_max_scale(feats[17] * feats[2]))
+    feats.append(_min_max_scale(feats[16] * feats[20]))
+    
+    # 29-33: Residual / Consensus proxies
+    mean_all = np.mean(feats[:10], axis=0)
+    feats.append(_min_max_scale(mean_all))
+    feats.append(_min_max_scale(np.median(feats[:15], axis=0)))
+    feats.append(_min_max_scale(feats[2] - feats[14]))
+    feats.append(_min_max_scale(feats[20] - feats[23]))
+    feats.append(_min_max_scale(np.std(feats[:10], axis=0)))
+    
+    return np.column_stack(feats)
+
+
+class LotteryBatchGDEnsembleModel:
+    """
+    Ensemble Gradiente Descendente Batch (Batch Gradient Descent Ensemble).
+    Fundamentado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 4:
+    'Batch Gradient Descent' (pp. 118-122).
+
+    Fundamentação Teórica:
+    - O Batch Gradient Descent utiliza a TOTALIDADE dos concursos do conjunto de treinamento
+      em cada época para computar o gradiente exato da função de perda (Log-Loss / Entropia Cruzada Binária)
+      com regularização L2 (Ridge penalty):
+      grad_w = (1 / M) * X_train.T @ (p - y) + l2_reg * w
+      grad_b = (1 / M) * sum(p - y)
+    - Garante convergência suave, monótona e direta para o mínimo global da superfície de perda convexa.
+    - Utiliza o espaço de atributos analíticos dos 33 métodos anteriores como matriz de meta-preditores.
+    """
+    def __init__(self,
+                 n_epochs: int = 150,
+                 learning_rate: float = 0.1,
+                 l2_reg: float = 1e-3,
+                 n_samples_history: int = 15,
+                 random_state: int = 42):
+        self.n_epochs = n_epochs
+        self.learning_rate = learning_rate
+        self.l2_reg = l2_reg
+        self.n_samples_history = n_samples_history
+        self.random_state = random_state
+
+        self.weights_: Optional[np.ndarray] = None
+        self.bias_: float = 0.0
+        self.loss_history_: List[float] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None, base_features: Optional[np.ndarray] = None) -> 'LotteryBatchGDEnsembleModel':
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+        cfg = cfg or {}
+        T, N = binary_matrix.shape
+        k = cfg.get('k', 6)
+
+        sample_indices = np.linspace(max(10, T - 45), T - 1, num=min(self.n_samples_history, max(3, T - 10)), dtype=int)
+        X_train_rows, y_train_rows = [], []
+        for idx in sample_indices:
+            feats_idx = _extract_gd_analytical_features(binary_matrix[:idx], cfg)
+            X_train_rows.append(feats_idx)
+            y_train_rows.append(binary_matrix[idx])
+
+        X_train = np.vstack(X_train_rows)
+        y_train = np.concatenate(y_train_rows).astype(float)
+        M_samples, D_feats = X_train.shape
+
+        rng = np.random.RandomState(self.random_state)
+        w = rng.normal(0, 0.01, size=D_feats)
+        b = 0.0
+        self.loss_history_ = []
+
+        for _ in range(self.n_epochs):
+            z = np.clip(X_train @ w + b, -25.0, 25.0)
+            p = 1.0 / (1.0 + np.exp(-z))
+            err = p - y_train
+            loss = -np.mean(y_train * np.log(p + 1e-12) + (1.0 - y_train) * np.log(1.0 - p + 1e-12)) + 0.5 * self.l2_reg * np.sum(w ** 2)
+            self.loss_history_.append(float(loss))
+            grad_w = (X_train.T @ err) / M_samples + self.l2_reg * w
+            grad_b = float(np.mean(err))
+            w -= self.learning_rate * grad_w
+            b -= self.learning_rate * grad_b
+
+        self.weights_ = w
+        self.bias_ = b
+
+        X_target = base_features if base_features is not None else _extract_gd_analytical_features(binary_matrix, cfg)
+        z_target = np.clip(X_target @ w + b, -25.0, 25.0)
+        p_target = 1.0 / (1.0 + np.exp(-z_target))
+        scores_final = _min_max_scale(p_target)
+
+        dezenas = np.arange(1, N + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_batch_gd': np.round(scores_final, 5),
+            'probabilidade_calibrada': np.round(p_target, 5),
+            'logit_predito': np.round(z_target, 5)
+        }).sort_values('escore_batch_gd', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted([int(x) for x in self.scores_df_.head(k)['dezena'].tolist()])
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted([int(x) for x in self.scores_df_.head(k)['dezena'].tolist()])
+
+    def get_scores_df(self) -> pd.DataFrame:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+class LotteryMiniBatchGDEnsembleModel:
+    """
+    Ensemble Gradiente Descendente Mini-Batch (Mini-Batch Gradient Descent Ensemble).
+    Fundamentado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 4:
+    'Mini-batch Gradient Descent' (pp. 124-125).
+
+    Fundamentação Teórica:
+    - O Mini-Batch Gradient Descent computa os gradientes sobre pequenos lotes aleatórios
+      de instâncias (batch_size tipicamente 16 ou 32).
+    - Vantagens Teóricas:
+      1. Ganho de desempenho via vetorização de operações matriciais em hardware moderno.
+      2. Trajetória com ruído estocástico controlado, permitindo escapar de mínimos locais rasos
+         sem a instabilidade extrema do SGD puro.
+      3. Regularização intrínseca contra memorização de ruído amostral de concursos efêmeros.
+    """
+    def __init__(self,
+                 n_epochs: int = 40,
+                 batch_size: int = 32,
+                 learning_rate: float = 0.05,
+                 l2_reg: float = 1e-3,
+                 n_samples_history: int = 15,
+                 random_state: int = 42):
+        self.n_epochs = n_epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.l2_reg = l2_reg
+        self.n_samples_history = n_samples_history
+        self.random_state = random_state
+
+        self.weights_: Optional[np.ndarray] = None
+        self.bias_: float = 0.0
+        self.loss_history_: List[float] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None, base_features: Optional[np.ndarray] = None) -> 'LotteryMiniBatchGDEnsembleModel':
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+        cfg = cfg or {}
+        T, N = binary_matrix.shape
+        k = cfg.get('k', 6)
+
+        sample_indices = np.linspace(max(10, T - 45), T - 1, num=min(self.n_samples_history, max(3, T - 10)), dtype=int)
+        X_train_rows, y_train_rows = [], []
+        for idx in sample_indices:
+            feats_idx = _extract_gd_analytical_features(binary_matrix[:idx], cfg)
+            X_train_rows.append(feats_idx)
+            y_train_rows.append(binary_matrix[idx])
+
+        X_train = np.vstack(X_train_rows)
+        y_train = np.concatenate(y_train_rows).astype(float)
+        M_samples, D_feats = X_train.shape
+
+        rng = np.random.RandomState(self.random_state)
+        w = rng.normal(0, 0.01, size=D_feats)
+        b = 0.0
+        self.loss_history_ = []
+
+        for _ in range(self.n_epochs):
+            perm = rng.permutation(M_samples)
+            epoch_loss = 0.0
+            n_batches = 0
+            for start_i in range(0, M_samples, self.batch_size):
+                b_idx = perm[start_i:start_i + self.batch_size]
+                X_b, y_b = X_train[b_idx], y_train[b_idx]
+                z_b = np.clip(X_b @ w + b, -25.0, 25.0)
+                p_b = 1.0 / (1.0 + np.exp(-z_b))
+                err_b = p_b - y_b
+                grad_w = (X_b.T @ err_b) / len(b_idx) + self.l2_reg * w
+                grad_b = float(np.mean(err_b))
+                w -= self.learning_rate * grad_w
+                b -= self.learning_rate * grad_b
+                epoch_loss += -np.mean(y_b * np.log(p_b + 1e-12) + (1.0 - y_b) * np.log(1.0 - p_b + 1e-12))
+                n_batches += 1
+            self.loss_history_.append(float(epoch_loss / max(1, n_batches)))
+
+        self.weights_ = w
+        self.bias_ = b
+
+        X_target = base_features if base_features is not None else _extract_gd_analytical_features(binary_matrix, cfg)
+        z_target = np.clip(X_target @ w + b, -25.0, 25.0)
+        p_target = 1.0 / (1.0 + np.exp(-z_target))
+        scores_final = _min_max_scale(p_target)
+
+        dezenas = np.arange(1, N + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_minibatch_gd': np.round(scores_final, 5),
+            'probabilidade_calibrada': np.round(p_target, 5),
+            'logit_predito': np.round(z_target, 5)
+        }).sort_values('escore_minibatch_gd', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted([int(x) for x in self.scores_df_.head(k)['dezena'].tolist()])
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted([int(x) for x in self.scores_df_.head(k)['dezena'].tolist()])
+
+    def get_scores_df(self) -> pd.DataFrame:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+class LotteryStochasticGDEnsembleModel:
+    """
+    Ensemble Gradiente Descendente Estocástico (Stochastic Gradient Descent Ensemble / Online SGD).
+    Fundamentado em Aurélien Géron (2019), Hands-On Machine Learning (2ª Ed.), Capítulo 4:
+    'Stochastic Gradient Descent' (pp. 122-124).
+
+    Fundamentação Teórica:
+    - O SGD escolhe uma única instância aleatória em cada iteração e calcula o gradiente baseado
+      apenas nessa observação individual:
+      grad_w_i = (p_i - y_i) * x_i + l2_reg * w
+      grad_b_i = p_i - y_i
+    - Utiliza cronograma de taxa de aprendizado decrescente (Learning Schedule, Géron Eq. 4-2):
+      eta_t = eta_0 / (1 + decay * t)
+    - Adaptação imediata a choques de regime recentes, com capacidade intrínseca de escapar
+      de ótimos locais estáticos.
+    """
+    def __init__(self,
+                 n_epochs: int = 15,
+                 learning_rate_0: float = 0.05,
+                 decay: float = 0.005,
+                 l2_reg: float = 1e-3,
+                 n_samples_history: int = 15,
+                 random_state: int = 42):
+        self.n_epochs = n_epochs
+        self.learning_rate_0 = learning_rate_0
+        self.decay = decay
+        self.l2_reg = l2_reg
+        self.n_samples_history = n_samples_history
+        self.random_state = random_state
+
+        self.weights_: Optional[np.ndarray] = None
+        self.bias_: float = 0.0
+        self.loss_history_: List[float] = []
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None, base_features: Optional[np.ndarray] = None) -> 'LotteryStochasticGDEnsembleModel':
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+        cfg = cfg or {}
+        T, N = binary_matrix.shape
+        k = cfg.get('k', 6)
+
+        sample_indices = np.linspace(max(10, T - 45), T - 1, num=min(self.n_samples_history, max(3, T - 10)), dtype=int)
+        X_train_rows, y_train_rows = [], []
+        for idx in sample_indices:
+            feats_idx = _extract_gd_analytical_features(binary_matrix[:idx], cfg)
+            X_train_rows.append(feats_idx)
+            y_train_rows.append(binary_matrix[idx])
+
+        X_train = np.vstack(X_train_rows)
+        y_train = np.concatenate(y_train_rows).astype(float)
+        M_samples, D_feats = X_train.shape
+
+        rng = np.random.RandomState(self.random_state)
+        w = rng.normal(0, 0.01, size=D_feats)
+        b = 0.0
+        self.loss_history_ = []
+
+        t_step = 0
+        for _ in range(self.n_epochs):
+            perm = rng.permutation(M_samples)
+            epoch_loss = 0.0
+            for idx_i in perm:
+                x_i = X_train[idx_i]
+                y_i = y_train[idx_i]
+                eta = self.learning_rate_0 / (1.0 + self.decay * t_step)
+                t_step += 1
+                z_i = float(np.clip(np.dot(x_i, w) + b, -25.0, 25.0))
+                p_i = 1.0 / (1.0 + np.exp(-z_i))
+                err_i = p_i - y_i
+                w -= eta * (err_i * x_i + self.l2_reg * w)
+                b -= eta * err_i
+                epoch_loss += -(y_i * np.log(p_i + 1e-12) + (1.0 - y_i) * np.log(1.0 - p_i + 1e-12))
+            self.loss_history_.append(float(epoch_loss / M_samples))
+
+        self.weights_ = w
+        self.bias_ = b
+
+        X_target = base_features if base_features is not None else _extract_gd_analytical_features(binary_matrix, cfg)
+        z_target = np.clip(X_target @ w + b, -25.0, 25.0)
+        p_target = 1.0 / (1.0 + np.exp(-z_target))
+        scores_final = _min_max_scale(p_target)
+
+        dezenas = np.arange(1, N + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_stochastic_gd': np.round(scores_final, 5),
+            'probabilidade_calibrada': np.round(p_target, 5),
+            'logit_predito': np.round(z_target, 5)
+        }).sort_values('escore_stochastic_gd', ascending=False).reset_index(drop=True)
+        self.top_k_ = sorted([int(x) for x in self.scores_df_.head(k)['dezena'].tolist()])
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None) -> List[int]:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+        return sorted([int(x) for x in self.scores_df_.head(k)['dezena'].tolist()])
+
+    def get_scores_df(self) -> pd.DataFrame:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
 
 
 
@@ -3596,6 +4009,54 @@ def predict_balanced_ensemble(binary_matrix: np.ndarray,
     model = LotteryBalancedEnsembleModel(n_estimators=n_estimators, voting=voting, random_state=random_state)
     model.fit(binary_matrix, cfg=cfg)
     return model.predict_top_k(k_actual)
+
+def predict_batch_gd_ensemble(binary_matrix: np.ndarray,
+                              cfg: Dict,
+                              k: Optional[int] = None,
+                              n_epochs: int = 150,
+                              learning_rate: float = 0.1,
+                              l2_reg: float = 1e-3,
+                              random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Batch Gradient Descent."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryBatchGDEnsembleModel(n_epochs=n_epochs, learning_rate=learning_rate,
+                                        l2_reg=l2_reg, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+def predict_minibatch_gd_ensemble(binary_matrix: np.ndarray,
+                                  cfg: Dict,
+                                  k: Optional[int] = None,
+                                  n_epochs: int = 40,
+                                  batch_size: int = 32,
+                                  learning_rate: float = 0.05,
+                                  l2_reg: float = 1e-3,
+                                  random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Mini-Batch Gradient Descent."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryMiniBatchGDEnsembleModel(n_epochs=n_epochs, batch_size=batch_size,
+                                            learning_rate=learning_rate, l2_reg=l2_reg,
+                                            random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
+def predict_stochastic_gd_ensemble(binary_matrix: np.ndarray,
+                                   cfg: Dict,
+                                   k: Optional[int] = None,
+                                   n_epochs: int = 15,
+                                   learning_rate_0: float = 0.05,
+                                   decay: float = 0.005,
+                                   l2_reg: float = 1e-3,
+                                   random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Ensemble Stochastic Gradient Descent (Online SGD)."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryStochasticGDEnsembleModel(n_epochs=n_epochs, learning_rate_0=learning_rate_0,
+                                             decay=decay, l2_reg=l2_reg, random_state=random_state)
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
 
 
 
@@ -3783,6 +4244,18 @@ def run_all_lottery_methods(filepath: str,
     m_bal_ens.fit(binary_matrix, cfg=cfg)
     pred_bal_ens = m_bal_ens.predict_top_k(k)
 
+    m_batch_gd = LotteryBatchGDEnsembleModel(n_epochs=150, learning_rate=0.1, random_state=42)
+    m_batch_gd.fit(binary_matrix, cfg=cfg)
+    pred_batch_gd = m_batch_gd.predict_top_k(k)
+
+    m_minibatch_gd = LotteryMiniBatchGDEnsembleModel(n_epochs=40, batch_size=32, learning_rate=0.05, random_state=42)
+    m_minibatch_gd.fit(binary_matrix, cfg=cfg)
+    pred_minibatch_gd = m_minibatch_gd.predict_top_k(k)
+
+    m_stoch_gd = LotteryStochasticGDEnsembleModel(n_epochs=15, learning_rate_0=0.05, decay=0.005, random_state=42)
+    m_stoch_gd.fit(binary_matrix, cfg=cfg)
+    pred_stoch_gd = m_stoch_gd.predict_top_k(k)
+
     predictions_ensemble = {
         'Ensemble Bagging': pred_bagging,
         'Ensemble Pasting': pred_pasting,
@@ -3793,7 +4266,10 @@ def run_all_lottery_methods(filepath: str,
         'Ensemble Residual Cycling Gradient Boosting': pred_cycle_gb,
         'Ensemble Stacking': pred_stacking,
         'Ensemble Frequência/Atraso Momentum': pred_mom_ens,
-        'Ensemble Frequência/Atraso Balanceado': pred_bal_ens
+        'Ensemble Frequência/Atraso Balanceado': pred_bal_ens,
+        'Ensemble Batch Gradient Descent': pred_batch_gd,
+        'Ensemble Mini-Batch Gradient Descent': pred_minibatch_gd,
+        'Ensemble Stochastic Gradient Descent': pred_stoch_gd
     }
 
     predictions = {
@@ -3835,6 +4311,9 @@ def run_all_lottery_methods(filepath: str,
         predictions['Metodo 27 (Ensemble Stacking - Stacked Generalization)'] = pred_stacking
         predictions['Metodo 28 (Ensemble Frequencia/Atraso Momentum - Multi-Janela)'] = pred_mom_ens
         predictions['Metodo 29 (Ensemble Frequencia/Atraso Balanceado - Multi-Escala)'] = pred_bal_ens
+        predictions['Metodo 30 (Ensemble Batch Gradient Descent - Full Batch GD)'] = pred_batch_gd
+        predictions['Metodo 31 (Ensemble Mini-Batch Gradient Descent - Mini-Batch GD)'] = pred_minibatch_gd
+        predictions['Metodo 32 (Ensemble Stochastic Gradient Descent - Online SGD)'] = pred_stoch_gd
 
     comparison_records = []
     for name, nums in predictions.items():
@@ -3866,6 +4345,9 @@ def run_all_lottery_methods(filepath: str,
         'm_stacking': m_stacking,
         'm_mom_ens': m_mom_ens,
         'm_bal_ens': m_bal_ens,
+        'm_batch_gd': m_batch_gd,
+        'm_minibatch_gd': m_minibatch_gd,
+        'm_stoch_gd': m_stoch_gd,
         'pred_consenso': pred_consenso,
         'consensus_scores': ball_scores,
         'predictions': predictions,
