@@ -1542,7 +1542,10 @@ class BayesianDecisionModel:
 
         # Matriz de covariância empírica entre as dezenas
 
-        self.cov_matrix_ = np.cov(binary_matrix, rowvar=False)
+        if n_concursos > 1:
+            self.cov_matrix_ = np.cov(binary_matrix, rowvar=False)
+        else:
+            self.cov_matrix_ = np.zeros((n_dezenas, n_dezenas))
 
 
 
@@ -6060,7 +6063,844 @@ class LotteryDualLogitGBEnsembleModel:
 
 
 
-LotteryHierarchicalLogitGBEnsembleModel = LotteryDualLogitGBEnsembleModel
+LotteryHierarchicalLogitGBEnsembleModel = LotteryDualLogitGBEnsembleModel
+
+
+
+
+
+def _extract_trained_ensemble_signals(trained_ensembles: Dict[str, Any],
+                                      n_dezenas: int,
+                                      include_sub_estimators: bool = True) -> Tuple[List[str], np.ndarray, np.ndarray, List[str], np.ndarray]:
+    """
+    Extrai os vetores de escores normalizados em [0, 1] e priors Out-of-Bag (OOB)
+    a partir de um dicionário de ensembles já treinados.
+
+    Retorna:
+      - main_names: nomes dos ensembles principais válidos
+      - main_matrix: matriz shape (K_main, n_dezenas)
+      - main_oob_priors: vetor shape (K_main,) com bônus OOB não-negativos (Zero Lookahead)
+      - sub_names: nomes dos sub-estimadores internos extraídos
+      - sub_matrix: matriz shape (K_sub, n_dezenas) (ou shape (0, n_dezenas))
+    """
+    preferred_score_cols = [
+        'probabilidade_calibrada',
+        'escore_dual_logit_gb',
+        'escore_meta_logit_gb',
+        'escore_bagging',
+        'escore_pasting',
+        'escore_adaboost',
+        'escore_gradboost',
+        'escore_stoch_gradboost',
+        'escore_logit_gradboost',
+        'escore_cycling_gradboost',
+        'escore_stacking',
+        'escore_momentum_ensemble',
+        'escore_balanceado_ensemble',
+        'escore_batch_gd',
+        'escore_minibatch_gd',
+        'escore_stochastic_gd',
+        'escore_meta_comite',
+        'escore_comite_profundo',
+    ]
+
+    def _df_to_score_vec(df_scores: pd.DataFrame) -> Optional[np.ndarray]:
+        if df_scores is None or len(df_scores) == 0 or 'dezena' not in df_scores.columns:
+            return None
+        col_sel = None
+        for c in preferred_score_cols:
+            if c in df_scores.columns:
+                col_sel = c
+                break
+        if col_sel is None:
+            escore_cols = [c for c in df_scores.columns if str(c).startswith('escore_') or str(c).startswith('prob')]
+            if not escore_cols:
+                return None
+            col_sel = escore_cols[0]
+
+        vec = np.zeros(n_dezenas, dtype=float)
+        for _, row in df_scores.iterrows():
+            d_idx = int(row['dezena']) - 1
+            if 0 <= d_idx < n_dezenas:
+                val = float(row[col_sel])
+                vec[d_idx] = 0.0 if not np.isfinite(val) else val
+        return _min_max_scale(vec)
+
+    main_names: List[str] = []
+    main_vecs: List[np.ndarray] = []
+    main_oobs: List[Optional[float]] = []
+    sub_names: List[str] = []
+    sub_vecs: List[np.ndarray] = []
+
+    for ens_name, obj in trained_ensembles.items():
+        if obj is None:
+            continue
+        vec_main: Optional[np.ndarray] = None
+        oob_val: Optional[float] = None
+
+        if isinstance(obj, np.ndarray) and obj.ndim == 1 and len(obj) == n_dezenas:
+            vec_main = _min_max_scale(np.nan_to_num(obj.astype(float), nan=0.0, posinf=1.0, neginf=0.0))
+        elif isinstance(obj, dict) and 'scores' in obj:
+            arr = np.asarray(obj['scores'], dtype=float)
+            if arr.ndim == 1 and len(arr) == n_dezenas:
+                vec_main = _min_max_scale(np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0))
+            raw_oob = obj.get('oob_score')
+            if isinstance(raw_oob, (int, float, np.floating, np.integer)) and np.isfinite(raw_oob) and float(raw_oob) > 0:
+                oob_val = float(raw_oob)
+        elif hasattr(obj, 'scores_df_') and obj.scores_df_ is not None:
+            vec_main = _df_to_score_vec(obj.scores_df_)
+            raw_oob = getattr(obj, 'oob_score_', None)
+            if isinstance(raw_oob, (int, float, np.floating, np.integer)) and np.isfinite(raw_oob) and float(raw_oob) > 0:
+                oob_val = float(raw_oob)
+
+        if vec_main is None:
+            continue
+
+        main_names.append(str(ens_name))
+        main_vecs.append(vec_main)
+        main_oobs.append(oob_val)
+
+        if include_sub_estimators:
+            est_list = getattr(obj, 'estimators_', None)
+            if isinstance(est_list, list):
+                for idx_s, est_item in enumerate(est_list):
+                    if isinstance(est_item, dict) and 'scores' in est_item:
+                        s_arr = np.asarray(est_item['scores'], dtype=float)
+                        if s_arr.ndim == 1 and len(s_arr) == n_dezenas:
+                            sub_names.append(f"{ens_name}::est_{idx_s}")
+                            sub_vecs.append(_min_max_scale(np.nan_to_num(s_arr, nan=0.0)))
+
+            sub_mods = getattr(obj, 'sub_models_', None)
+            if isinstance(sub_mods, list):
+                for idx_s, sub_m in enumerate(sub_mods):
+                    sub_df = getattr(sub_m, 'scores_df_', None)
+                    if sub_df is not None:
+                        sv = _df_to_score_vec(sub_df)
+                        if sv is not None:
+                            sub_names.append(f"{ens_name}::sub_{idx_s}")
+                            sub_vecs.append(sv)
+
+            staged_list = getattr(obj, 'staged_scores_', None)
+            if isinstance(staged_list, list) and len(staged_list) > 1:
+                tail_stages = staged_list[1:][-4:]
+                for idx_s, st_arr in enumerate(tail_stages):
+                    s_arr = np.asarray(st_arr, dtype=float)
+                    if s_arr.ndim == 1 and len(s_arr) == n_dezenas:
+                        sub_names.append(f"{ens_name}::stage_{idx_s}")
+                        sub_vecs.append(_min_max_scale(np.nan_to_num(s_arr, nan=0.0)))
+
+    if not main_vecs:
+        return [], np.zeros((0, n_dezenas), dtype=float), np.zeros(0, dtype=float), [], np.zeros((0, n_dezenas), dtype=float)
+
+    main_mat = np.vstack(main_vecs)
+    valid_oobs = [v for v in main_oobs if v is not None]
+    if valid_oobs:
+        mean_obs = float(np.mean(valid_oobs))
+        filled_oobs = np.asarray([v if v is not None else mean_obs for v in main_oobs], dtype=float)
+        rel_dev = (filled_oobs - mean_obs) / max(mean_obs, 1e-8)
+        oob_norm = np.clip(0.5 + 2.5 * rel_dev, 0.0, 1.0)
+    else:
+        oob_norm = np.zeros(len(main_vecs), dtype=float)
+
+    sub_mat = np.vstack(sub_vecs) if sub_vecs else np.zeros((0, n_dezenas), dtype=float)
+    return main_names, main_mat, oob_norm, sub_names, sub_mat
+
+
+class LotteryPretrainedMetaCommitteeModel:
+    """
+    Meta-Ensemble em Comitê Estocástico de Ensembles Pré-Treinados (Método 35, padrão M=100).
+    Constrói um comitê de M membros (padrão M=100, suportando também M=50 ou qualquer M>0)
+    diretamente sobre os ensembles já treinados (e seus sub-estimadores internos), combinando:
+    1. Random Subspaces (Ho, 1998; Géron Cap. 7, pp. 196-197): cada membro do comitê
+       amostra sem reposição um subconjunto distinto dos ensembles pré-treinados e de
+       seus estimadores internos, reduzindo correlação inter-membros.
+    2. Ponderação Bayesiana Dirichlet com Prior OOB (Zero Lookahead Bias): sorteia pesos
+       simplex via Dirichlet(alpha_prior), atribuindo leve reforço aos estimadores que
+       possuem validação Out-of-Bag histórica positiva.
+    3. Calibração Termodinâmica (Softmax Temperature) + Fusão Híbrida Soft/Borda/Hard:
+       cada membro gera escore contínuo, probabilidade calibrada com temperatura tau_m,
+       rank Borda e cédula discreta top-k.
+    """
+
+    def __init__(self,
+                 n_committees: int = 100,
+                 subspace_ratio: float = 0.65,
+                 include_sub_estimators: bool = True,
+                 dirichlet_alpha: float = 1.5,
+                 voting: str = 'hybrid',
+                 temperature_range: Tuple[float, float] = (0.75, 1.50),
+                 random_state: int = 42):
+        if n_committees <= 0:
+            raise ValueError(f"n_committees deve ser estritamente positivo (> 0). Recebido: {n_committees}")
+        if not (0.0 < subspace_ratio <= 1.0):
+            raise ValueError(f"subspace_ratio deve estar no intervalo (0.0, 1.0]. Recebido: {subspace_ratio}")
+        if dirichlet_alpha <= 0.0:
+            raise ValueError(f"dirichlet_alpha deve ser > 0. Recebido: {dirichlet_alpha}")
+        if voting not in ('soft', 'hard', 'borda', 'hybrid'):
+            raise ValueError(f"voting deve ser 'soft', 'hard', 'borda' ou 'hybrid'. Recebido: {voting}")
+        if len(temperature_range) != 2 or temperature_range[0] <= 0.0 or temperature_range[0] > temperature_range[1]:
+            raise ValueError(f"temperature_range inválido: {temperature_range}")
+
+        self.n_committees = int(n_committees)
+        self.subspace_ratio = float(subspace_ratio)
+        self.include_sub_estimators = bool(include_sub_estimators)
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.voting = voting
+        self.temperature_range = temperature_range
+        self.random_state = int(random_state)
+
+        self.trained_ensembles_: Dict[str, Any] = {}
+        self.base_ensemble_names_: List[str] = []
+        self.sub_estimator_count_: int = 0
+        self.ensemble_contributions_: Dict[str, float] = {}
+        self.committee_members_: List[Dict[str, Any]] = []
+        self.convergence_curve_: List[Dict[str, float]] = []
+        self.committee_std_: Optional[np.ndarray] = None
+        self.mean_se_: float = 0.0
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def _fit_default_base_ensembles(self, binary_matrix: np.ndarray, cfg: Dict) -> Dict[str, Any]:
+        n_concursos = binary_matrix.shape[0]
+        base_bank: Dict[str, Any] = {}
+
+        m_bag = LotteryBaggingModel(n_estimators=10, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_paste = LotteryPastingModel(n_estimators=10, max_samples=0.8, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_ada = LotteryAdaBoostModel(n_estimators=10, learning_rate=1.0, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_gb = LotteryGradientBoostingModel(n_estimators=10, learning_rate=0.5, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_stoch_gb = LotteryStochasticGradientBoostingModel(n_estimators=10, learning_rate=0.5, subsample=0.7, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_logit_gb = LotteryLogitGradientBoostingModel(n_estimators=10, learning_rate=0.3, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_cycle_gb = LotteryResidualCyclingGradientBoostingModel(n_estimators=8, learning_rate=0.4, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_mom = LotteryMomentumEnsembleModel(n_estimators=10, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_bal = LotteryBalancedEnsembleModel(n_estimators=10, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_bagged_lgb = LotteryBaggedLogitGBEnsembleModel(n_estimators=10, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+        m_dual_lgb = LotteryDualLogitGBEnsembleModel(
+            n_estimators_bagged=10, weight_base=0.45, random_state=self.random_state
+        ).fit(binary_matrix, cfg=cfg, base_model=m_logit_gb, bagged_model=m_bagged_lgb)
+
+        base_bank.update({
+            'bagging': m_bag,
+            'pasting': m_paste,
+            'adaboost': m_ada,
+            'gradboost': m_gb,
+            'stoch_gb': m_stoch_gb,
+            'logit_gb': m_logit_gb,
+            'cycle_gb': m_cycle_gb,
+            'mom_ens': m_mom,
+            'bal_ens': m_bal,
+            'bagged_logit_gb': m_bagged_lgb,
+            'dual_logit_gb': m_dual_lgb,
+        })
+
+        if n_concursos >= 15:
+            for key, cls_fn in [
+                ('stacking', lambda: LotteryStackingModel(holdout_ratio=0.25, random_state=self.random_state).fit(binary_matrix, cfg=cfg)),
+                ('batch_gd', lambda: LotteryBatchGDEnsembleModel(n_epochs=80, learning_rate=0.1, random_state=self.random_state).fit(binary_matrix, cfg=cfg)),
+                ('minibatch_gd', lambda: LotteryMiniBatchGDEnsembleModel(n_epochs=30, batch_size=32, learning_rate=0.05, random_state=self.random_state).fit(binary_matrix, cfg=cfg)),
+                ('stoch_gd', lambda: LotteryStochasticGDEnsembleModel(n_epochs=15, learning_rate_0=0.05, decay=0.005, random_state=self.random_state).fit(binary_matrix, cfg=cfg)),
+            ]:
+                try:
+                    base_bank[key] = cls_fn()
+                except Exception:
+                    pass
+
+        return base_bank
+
+    def fit(self,
+            binary_matrix: np.ndarray,
+            cfg: Optional[Dict] = None,
+            trained_ensembles: Optional[Dict[str, Any]] = None) -> 'LotteryPretrainedMetaCommitteeModel':
+        """
+        Estima o Meta-Comitê de M membros baseado nos ensembles já treinados.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        _, n_dezenas = binary_matrix.shape
+        k = int(cfg.get('k', 6))
+
+        if trained_ensembles is not None:
+            if not isinstance(trained_ensembles, dict) or len(trained_ensembles) == 0:
+                raise ValueError("trained_ensembles deve ser um dicionário não-vazio com ensembles ajustados.")
+            self.trained_ensembles_ = dict(trained_ensembles)
+        else:
+            self.trained_ensembles_ = self._fit_default_base_ensembles(binary_matrix, cfg)
+
+        main_names, main_mat, oob_norm, sub_names, sub_mat = _extract_trained_ensemble_signals(
+            self.trained_ensembles_, n_dezenas, include_sub_estimators=self.include_sub_estimators
+        )
+        if len(main_names) == 0:
+            raise ValueError("trained_ensembles não contém nenhum ensemble ajustado válido.")
+
+        self.base_ensemble_names_ = main_names
+        self.sub_estimator_count_ = len(sub_names)
+
+        k_main = len(main_names)
+        k_sub = len(sub_names)
+        q_main = max(1, min(k_main, int(np.ceil(self.subspace_ratio * k_main))))
+        if k_main >= 3:
+            q_main = max(2, q_main)
+        q_sub = max(1, min(k_sub, int(np.ceil(self.subspace_ratio * k_sub)))) if k_sub > 0 else 0
+
+        alpha_prior = self.dirichlet_alpha * (1.0 + 0.35 * oob_norm)
+        rng = np.random.RandomState(self.random_state)
+        t_min, t_max = self.temperature_range
+
+        all_soft = np.zeros((self.n_committees, n_dezenas), dtype=float)
+        all_probs = np.zeros((self.n_committees, n_dezenas), dtype=float)
+        all_borda = np.zeros((self.n_committees, n_dezenas), dtype=float)
+        hard_votes = np.zeros(n_dezenas, dtype=float)
+        accum_weights = np.zeros(k_main, dtype=float)
+
+        self.committee_members_ = []
+        self.convergence_curve_ = []
+
+        running_soft = np.zeros(n_dezenas, dtype=float)
+        prev_top_set: Optional[set] = None
+
+        for m in range(self.n_committees):
+            idx_main = rng.choice(k_main, size=q_main, replace=False)
+            w_main = rng.dirichlet(alpha_prior[idx_main])
+            accum_weights[idx_main] += w_main
+            s_main = w_main @ main_mat[idx_main]
+
+            if q_sub > 0:
+                idx_sub = rng.choice(k_sub, size=q_sub, replace=False)
+                w_sub = rng.dirichlet(np.full(q_sub, self.dirichlet_alpha))
+                s_sub = w_sub @ sub_mat[idx_sub]
+                beta_sub = float(rng.uniform(0.20, 0.45))
+                s_raw = (1.0 - beta_sub) * _min_max_scale(s_main) + beta_sub * _min_max_scale(s_sub)
+            else:
+                s_raw = _min_max_scale(s_main)
+
+            s_norm = _min_max_scale(s_raw)
+            temp_m = float(rng.uniform(t_min, t_max))
+            std_s = float(np.std(s_norm))
+            z_s = (s_norm - float(np.mean(s_norm))) / (std_s if std_s > 1e-12 else 1.0)
+            logits = np.clip(z_s / temp_m, -20.0, 20.0)
+            exp_l = np.exp(logits - np.max(logits))
+            p_m = exp_l / np.sum(exp_l)
+
+            order = np.argsort(s_norm, kind='mergesort')[::-1]
+            borda_m = np.zeros(n_dezenas, dtype=float)
+            denom = float(max(1, n_dezenas - 1))
+            for r_idx, d_idx in enumerate(order):
+                borda_m[d_idx] = 1.0 - (r_idx / denom)
+
+            k_ballot = min(max(1, k), n_dezenas)
+            top_m = sorted((order[:k_ballot] + 1).tolist())
+            for dez in top_m:
+                hard_votes[dez - 1] += 1.0
+
+            all_soft[m] = s_norm
+            all_probs[m] = p_m
+            all_borda[m] = borda_m
+
+            self.committee_members_.append({
+                'member_idx': m,
+                'n_main_selected': q_main,
+                'n_sub_selected': q_sub,
+                'temperature': round(temp_m, 4),
+                'top_k': top_m,
+            })
+
+            running_soft += s_norm
+            cur_mean = running_soft / float(m + 1)
+            cur_top_set = set((np.argsort(cur_mean, kind='mergesort')[::-1][:k_ballot] + 1).tolist())
+            if prev_top_set is not None:
+                union_sz = len(cur_top_set | prev_top_set)
+                jaccard = len(cur_top_set & prev_top_set) / float(union_sz) if union_sz > 0 else 1.0
+            else:
+                jaccard = 1.0
+            prev_top_set = cur_top_set
+            self.convergence_curve_.append({
+                'committee_size': m + 1,
+                'top_k_jaccard': round(float(jaccard), 4),
+                'score_se': round(float(np.mean(np.std(all_soft[:m + 1], axis=0) / np.sqrt(m + 1))), 6)
+            })
+
+        soft_mean = np.mean(all_soft, axis=0)
+        prob_mean = np.mean(all_probs, axis=0)
+        borda_mean = np.mean(all_borda, axis=0)
+        vote_rate = hard_votes / float(self.n_committees)
+
+        self.committee_std_ = np.std(all_soft, axis=0)
+        se_vec = self.committee_std_ / np.sqrt(float(self.n_committees))
+        self.mean_se_ = float(np.mean(se_vec))
+        self.ensemble_contributions_ = {
+            main_names[i]: float(np.round(accum_weights[i] / float(self.n_committees), 5))
+            for i in range(k_main)
+        }
+
+        hybrid_raw = (
+            0.35 * _min_max_scale(soft_mean)
+            + 0.25 * _min_max_scale(prob_mean)
+            + 0.20 * _min_max_scale(borda_mean)
+            + 0.20 * vote_rate
+        )
+        hybrid_norm = _min_max_scale(hybrid_raw)
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_meta_comite': np.round(hybrid_norm, 5),
+            'probabilidade_comite': np.round(prob_mean, 5),
+            'escore_soft': np.round(soft_mean, 5),
+            'escore_borda': np.round(borda_mean, 5),
+            'votos_hard': hard_votes.astype(int),
+            'taxa_consenso_pct': np.round(vote_rate * 100.0, 2),
+            'incerteza_se': np.round(se_vec, 6),
+        }).sort_values(['escore_meta_comite', 'escore_soft', 'dezena'], ascending=[False, False, True]).reset_index(drop=True)
+
+        k_sel = min(max(1, k), n_dezenas) if k > 0 else 0
+        self.top_k_ = self.predict_top_k(k_sel, voting=self.voting) if k_sel > 0 else []
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None, voting: Optional[str] = None) -> List[int]:
+        """Retorna as top K dezenas segundo o critério de votação do Meta-Comitê."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+
+        use_voting = voting or self.voting
+        if use_voting == 'hard':
+            df_sorted = self.scores_df_.sort_values(
+                ['votos_hard', 'escore_meta_comite', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'soft':
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_soft', 'escore_meta_comite', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'borda':
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_borda', 'escore_meta_comite', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'hybrid':
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_meta_comite', 'votos_hard', 'dezena'], ascending=[False, False, True]
+            )
+        else:
+            raise ValueError(f"voting deve ser 'soft', 'hard', 'borda' ou 'hybrid'. Recebido: {use_voting}")
+
+        return sorted([int(x) for x in df_sorted.head(k)['dezena'].tolist()])
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com os escores do Meta-Comitê."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+LotterySuperEnsembleCommitteeModel = LotteryPretrainedMetaCommitteeModel
+
+
+class LotteryDeepEnsembleCommitteeModel:
+    """
+    Meta-Ensemble Comitê Profundo Multi-Família Re-Estimado (Método 36, padrão M=100).
+    Treina um comitê robusto de M membros (padrão M=100, suportando também M=50 ou qualquer M>0)
+    sobre réplicas bootstrap cronológicas de binary_matrix, ciclando por 6 paradigmas de
+    ensembles de alta performance do projeto e ancorando sobre os ensembles já treinados:
+      1. Logit Gradient Boosting (Binomial Deviance com perturbação de eta e estágios)
+      2. Residual Cycling / Stochastic Gradient Boosting (ciclagem residual multi-modelo)
+      3. Momentum Multi-Janela com Bootstrap (decaimento exponencial multi-escala)
+      4. Balanceado Multi-Escala com Bootstrap (frequência ponderada + atraso relativo)
+      5. Gradiente Descendente com Subespaço de Atributos Analíticos (GD Bootstrap)
+      6. Bayesiano Adaptativo + Geometria de Gianella com Bootstrap
+
+    Inclui validação Out-of-Bag (OOB) vetorizada por membro (Zero Lookahead Bias),
+    ponderação OOB suave e fusão convexa com a âncora dos ensembles já treinados.
+    """
+
+    SUPPORTED_FAMILIES = (
+        'logit_gb',
+        'cycling_gb',
+        'stoch_gb',
+        'momentum_bootstrap',
+        'balanced_bootstrap',
+        'gd_bootstrap',
+        'bayes_gianella_bootstrap',
+    )
+
+    def __init__(self,
+                 n_committees: int = 100,
+                 max_samples: float = 0.85,
+                 anchor_weight: float = 0.30,
+                 weight_by_oob: bool = True,
+                 oob_score: bool = True,
+                 voting: str = 'hybrid',
+                 families: Optional[List[str]] = None,
+                 random_state: int = 42):
+        if n_committees <= 0:
+            raise ValueError(f"n_committees deve ser estritamente positivo (> 0). Recebido: {n_committees}")
+        if not (0.0 < max_samples <= 1.0):
+            raise ValueError(f"max_samples deve estar no intervalo (0.0, 1.0]. Recebido: {max_samples}")
+        if not (0.0 <= anchor_weight <= 1.0):
+            raise ValueError(f"anchor_weight deve estar entre 0.0 e 1.0. Recebido: {anchor_weight}")
+        if voting not in ('soft', 'hard', 'hybrid'):
+            raise ValueError(f"voting deve ser 'soft', 'hard' ou 'hybrid'. Recebido: {voting}")
+
+        if families is None:
+            families = [
+                'logit_gb',
+                'cycling_gb',
+                'momentum_bootstrap',
+                'balanced_bootstrap',
+                'gd_bootstrap',
+                'bayes_gianella_bootstrap',
+            ]
+        else:
+            if len(families) == 0:
+                raise ValueError("families não pode ser vazio.")
+            for fam in families:
+                if fam not in self.SUPPORTED_FAMILIES:
+                    raise ValueError(f"Família '{fam}' inválida. Suportadas: {self.SUPPORTED_FAMILIES}")
+
+        self.n_committees = int(n_committees)
+        self.max_samples = float(max_samples)
+        self.anchor_weight = float(anchor_weight)
+        self.weight_by_oob = bool(weight_by_oob)
+        self.oob_score = bool(oob_score)
+        self.voting = voting
+        self.families = list(families)
+        self.random_state = int(random_state)
+
+        self.estimators_: List[Dict[str, Any]] = []
+        self.oob_score_: float = 0.0
+        self.family_oob_scores_: Dict[str, float] = {}
+        self.convergence_curve_: List[Dict[str, float]] = []
+        self.committee_std_: Optional[np.ndarray] = None
+        self.mean_se_: float = 0.0
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+
+    def _compute_anchor_scores(self,
+                               binary_matrix: np.ndarray,
+                               cfg: Dict,
+                               trained_ensembles: Optional[Dict[str, Any]]) -> np.ndarray:
+        n_concursos, n_dezenas = binary_matrix.shape
+        if trained_ensembles is not None:
+            if not isinstance(trained_ensembles, dict) or len(trained_ensembles) == 0:
+                raise ValueError("trained_ensembles deve ser um dicionário não-vazio com ensembles ajustados.")
+            main_names, main_mat, oob_norm, _, _ = _extract_trained_ensemble_signals(
+                trained_ensembles, n_dezenas, include_sub_estimators=False
+            )
+            if len(main_names) == 0:
+                raise ValueError("trained_ensembles não contém nenhum ensemble ajustado válido.")
+            weights = 1.0 + 0.35 * oob_norm
+            weights /= np.sum(weights)
+            return _min_max_scale(weights @ main_mat)
+
+        # Fallback autônomo rápido quando trained_ensembles não é fornecido
+        anchor_models: Dict[str, Any] = {
+            'logit_gb': LotteryLogitGradientBoostingModel(n_estimators=10, learning_rate=0.3, random_state=self.random_state).fit(binary_matrix, cfg=cfg),
+            'cycle_gb': LotteryResidualCyclingGradientBoostingModel(n_estimators=8, learning_rate=0.4, random_state=self.random_state).fit(binary_matrix, cfg=cfg),
+            'mom_ens': LotteryMomentumEnsembleModel(n_estimators=10, random_state=self.random_state).fit(binary_matrix, cfg=cfg),
+            'bal_ens': LotteryBalancedEnsembleModel(n_estimators=10, random_state=self.random_state).fit(binary_matrix, cfg=cfg),
+            'bagged_lgb': LotteryBaggedLogitGBEnsembleModel(n_estimators=10, random_state=self.random_state).fit(binary_matrix, cfg=cfg),
+        }
+        if n_concursos >= 15:
+            try:
+                anchor_models['batch_gd'] = LotteryBatchGDEnsembleModel(n_epochs=60, learning_rate=0.1, random_state=self.random_state).fit(binary_matrix, cfg=cfg)
+            except Exception:
+                pass
+        _, main_mat, oob_norm, _, _ = _extract_trained_ensemble_signals(
+            anchor_models, n_dezenas, include_sub_estimators=False
+        )
+        weights = 1.0 + 0.35 * oob_norm
+        weights /= np.sum(weights)
+        return _min_max_scale(weights @ main_mat)
+
+    def fit(self,
+            binary_matrix: np.ndarray,
+            cfg: Optional[Dict] = None,
+            trained_ensembles: Optional[Dict[str, Any]] = None) -> 'LotteryDeepEnsembleCommitteeModel':
+        """
+        Treina o Comitê Profundo de M membros com bootstrap cronológico e validação OOB.
+        """
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        n_concursos, n_dezenas = binary_matrix.shape
+        k = int(cfg.get('k', 6))
+        k_ballot = min(max(1, k), n_dezenas)
+
+        rng = np.random.RandomState(self.random_state)
+        m_samples = max(1, int(self.max_samples * n_concursos))
+
+        anchor_scores = (
+            self._compute_anchor_scores(binary_matrix, cfg, trained_ensembles)
+            if self.anchor_weight > 0.0
+            else np.zeros(n_dezenas, dtype=float)
+        )
+
+        self.estimators_ = []
+        self.convergence_curve_ = []
+        all_scores = np.zeros((self.n_committees, n_dezenas), dtype=float)
+        member_oob_means: List[Optional[float]] = []
+        hard_votes = np.zeros(n_dezenas, dtype=float)
+
+        oob_hits_total = 0.0
+        oob_eval_count = 0
+        fam_oob_hits: Dict[str, float] = {f: 0.0 for f in self.families}
+        fam_oob_counts: Dict[str, int] = {f: 0 for f in self.families}
+
+        mom_half_lives = [15.0, 25.0, 40.0, 60.0, 90.0, 120.0, 180.0, 250.0]
+        bal_alphas = [0.25, 0.35, 0.50, 0.65, 0.75]
+        bal_half_lives = [30.0, 60.0, 100.0, 150.0, 250.0]
+        group_size = int(cfg.get('gianella_group_size', 10 if n_dezenas % 10 == 0 else (5 if n_dezenas % 5 == 0 else n_dezenas)))
+        alpha_0 = float(cfg.get('alpha_0', 1.0))
+        beta_0 = float(cfg.get('beta_0', 9.0))
+
+        running_sum = np.zeros(n_dezenas, dtype=float)
+        prev_top_set: Optional[set] = None
+
+        for m in range(self.n_committees):
+            fam = self.families[m % len(self.families)]
+            actual_fam = fam
+            boot_idx = np.sort(rng.choice(n_concursos, size=m_samples, replace=True))
+            oob_idx = np.setdiff1d(np.arange(n_concursos), boot_idx)
+            X_b = binary_matrix[boot_idx]
+            sub_seed = int(rng.randint(0, 1_000_000))
+
+            if fam == 'logit_gb':
+                n_iter = int(rng.randint(6, 13))
+                lr = float(rng.uniform(0.20, 0.45))
+                est = LotteryLogitGradientBoostingModel(
+                    n_estimators=n_iter, learning_rate=lr, random_state=sub_seed
+                ).fit(X_b, cfg=cfg)
+                probs = est.scores_df_.sort_values('dezena')['probabilidade_calibrada'].values
+                score_m = _min_max_scale(probs)
+
+            elif fam == 'cycling_gb':
+                n_iter = int(rng.randint(6, 11))
+                lr = float(rng.uniform(0.25, 0.50))
+                est = LotteryResidualCyclingGradientBoostingModel(
+                    n_estimators=n_iter, learning_rate=lr, random_state=sub_seed
+                ).fit(X_b, cfg=cfg)
+                vals = est.scores_df_.sort_values('dezena')['escore_cycling_gradboost'].values
+                score_m = _min_max_scale(vals)
+
+            elif fam == 'stoch_gb':
+                n_iter = int(rng.randint(6, 13))
+                lr = float(rng.uniform(0.30, 0.65))
+                subs = float(rng.uniform(0.60, 0.90))
+                est = LotteryStochasticGradientBoostingModel(
+                    n_estimators=n_iter, learning_rate=lr, subsample=subs, random_state=sub_seed
+                ).fit(X_b, cfg=cfg)
+                vals = est.scores_df_.sort_values('dezena')['escore_stoch_gradboost'].values
+                score_m = _min_max_scale(vals)
+
+            elif fam == 'momentum_bootstrap':
+                hl = float(mom_half_lives[m % len(mom_half_lives)] * rng.uniform(0.85, 1.15))
+                decay = 0.5 ** (1.0 / max(1.0, hl))
+                t_w = decay ** np.arange(len(boot_idx) - 1, -1, -1)
+                sum_w = float(np.sum(t_w))
+                w_freq = np.sum(X_b * t_w[:, None], axis=0) / (sum_w if sum_w > 0 else 1.0)
+                score_m = _min_max_scale(w_freq)
+
+            elif fam == 'balanced_bootstrap':
+                alpha_b = float(np.clip(bal_alphas[m % len(bal_alphas)] + rng.uniform(-0.08, 0.08), 0.10, 0.90))
+                hl_b = float(bal_half_lives[(m // len(bal_alphas)) % len(bal_half_lives)] * rng.uniform(0.85, 1.15))
+                est = FrequencyDelayModel(half_life=max(5.0, hl_b), alpha=alpha_b).fit(X_b)
+                vals = est.scores_df_.sort_values('dezena')['escore_composto'].values
+                score_m = _min_max_scale(vals)
+
+            elif fam == 'gd_bootstrap':
+                # Extrai snapshots estritamente dentro da réplica X_b (Zero vazamento de oob_idx)
+                X_gd = X_b[-min(len(X_b), 600):]
+                n_gd = len(X_gd)
+                if n_gd >= 2:
+                    sample_indices = np.unique(
+                        np.linspace(max(1, n_gd - 30), n_gd - 1,
+                                    num=min(8, max(1, n_gd - 1)), dtype=int)
+                    )
+                    gd_snaps = [
+                        (_extract_gd_analytical_features(X_gd[:idx], cfg), X_gd[idx].astype(float))
+                        for idx in sample_indices
+                    ]
+                    gd_tg = _extract_gd_analytical_features(X_gd, cfg)
+                    n_snap = len(gd_snaps)
+                    snap_idx = rng.choice(n_snap, size=max(3, n_snap), replace=True)
+                    X_tr = np.vstack([gd_snaps[i][0] for i in snap_idx])
+                    y_tr = np.concatenate([gd_snaps[i][1] for i in snap_idx])
+                    d_feats = X_tr.shape[1]
+                    q_feats = max(8, min(d_feats, int(np.ceil(0.75 * d_feats))))
+                    feat_idx = np.sort(rng.choice(d_feats, size=q_feats, replace=False))
+                    X_tr_sub = X_tr[:, feat_idx]
+                    X_tg_sub = gd_tg[:, feat_idx]
+                    w = rng.normal(0.0, 0.01, size=q_feats)
+                    b_val = 0.0
+                    lr_gd = float(rng.uniform(0.06, 0.14))
+                    l2_gd = float(rng.uniform(5e-4, 4e-3))
+                    m_rows = float(X_tr_sub.shape[0])
+                    for _ in range(60):
+                        z = np.clip(X_tr_sub @ w + b_val, -25.0, 25.0)
+                        p = 1.0 / (1.0 + np.exp(-z))
+                        err = p - y_tr
+                        w -= lr_gd * ((X_tr_sub.T @ err) / m_rows + l2_gd * w)
+                        b_val -= lr_gd * float(np.mean(err))
+                    p_tg = 1.0 / (1.0 + np.exp(-np.clip(X_tg_sub @ w + b_val, -25.0, 25.0)))
+                    score_m = _min_max_scale(p_tg)
+                else:
+                    actual_fam = 'bayes_gianella_bootstrap'
+
+            if actual_fam == 'bayes_gianella_bootstrap':
+                hl_bayes = float(rng.uniform(80.0, 220.0))
+                m_bayes = BayesianDecisionModel(
+                    alpha_0=alpha_0, beta_0=beta_0, decay_half_life=hl_bayes
+                ).fit(X_b)
+                b_vals = m_bayes.posterior_df_.sort_values('dezena')['esperanca_posteriori'].values
+                b_scaled = _min_max_scale(b_vals)
+                if group_size > 0 and n_dezenas % group_size == 0 and k_ballot <= n_dezenas:
+                    try:
+                        m_gia = GianellaColorTemplateModel(
+                            n_dezenas=n_dezenas, k=k_ballot, group_size=group_size
+                        ).fit(X_b)
+                        g_scaled = _min_max_scale(m_gia.dezena_scores_)
+                        score_m = _min_max_scale(0.65 * b_scaled + 0.35 * g_scaled)
+                    except Exception:
+                        score_m = b_scaled
+                else:
+                    score_m = b_scaled
+
+            score_m = np.nan_to_num(score_m, nan=0.0, posinf=1.0, neginf=0.0)
+            order_m = np.argsort(score_m, kind='mergesort')[::-1]
+            top_m = sorted((order_m[:k_ballot] + 1).tolist())
+            for dez in top_m:
+                hard_votes[dez - 1] += 1.0
+
+            all_scores[m] = score_m
+
+            m_oob_mean: Optional[float] = None
+            if self.oob_score and len(oob_idx) > 0:
+                top_mask = np.zeros(n_dezenas, dtype=float)
+                top_mask[np.array(top_m, dtype=int) - 1] = 1.0
+                hits_vec = binary_matrix[oob_idx] @ top_mask
+                m_oob_sum = float(hits_vec.sum())
+                n_oob_len = len(oob_idx)
+                m_oob_mean = m_oob_sum / float(n_oob_len)
+                oob_hits_total += m_oob_sum
+                oob_eval_count += n_oob_len
+                fam_oob_hits[actual_fam] = fam_oob_hits.get(actual_fam, 0.0) + m_oob_sum
+                fam_oob_counts[actual_fam] = fam_oob_counts.get(actual_fam, 0) + n_oob_len
+            member_oob_means.append(m_oob_mean)
+
+            self.estimators_.append({
+                'member_idx': m,
+                'family': actual_fam,
+                'n_oob': len(oob_idx),
+                'oob_mean_hits': round(m_oob_mean, 4) if m_oob_mean is not None else None,
+                'top_k': top_m,
+            })
+
+            running_sum += score_m
+            cur_mean = running_sum / float(m + 1)
+            cur_top_set = set((np.argsort(cur_mean, kind='mergesort')[::-1][:k_ballot] + 1).tolist())
+            if prev_top_set is not None:
+                union_sz = len(cur_top_set | prev_top_set)
+                jaccard = len(cur_top_set & prev_top_set) / float(union_sz) if union_sz > 0 else 1.0
+            else:
+                jaccard = 1.0
+            prev_top_set = cur_top_set
+            self.convergence_curve_.append({
+                'committee_size': m + 1,
+                'top_k_jaccard': round(float(jaccard), 4),
+                'score_se': round(float(np.mean(np.std(all_scores[:m + 1], axis=0) / np.sqrt(m + 1))), 6),
+            })
+
+        self.oob_score_ = float(oob_hits_total / oob_eval_count) if oob_eval_count > 0 else 0.0
+        self.family_oob_scores_ = {
+            f: round(float(fam_oob_hits[f] / fam_oob_counts[f]), 4) if fam_oob_counts[f] > 0 else 0.0
+            for f in fam_oob_counts
+        }
+
+        # Pesos OOB suaves (Zero Lookahead Bias)
+        valid_oobs = [x for x in member_oob_means if x is not None]
+        if self.weight_by_oob and len(valid_oobs) > 0:
+            mean_valid_oob = float(np.mean(valid_oobs))
+            oob_arr = np.asarray(
+                [x if x is not None else mean_valid_oob for x in member_oob_means],
+                dtype=float
+            )
+            std_oob = float(np.std(oob_arr))
+            if std_oob > 1e-8:
+                z_oob = (oob_arr - float(np.mean(oob_arr))) / std_oob
+                m_weights = np.clip(np.exp(0.35 * z_oob), 0.5, 2.0)
+            else:
+                m_weights = np.ones(self.n_committees, dtype=float)
+            m_weights /= np.sum(m_weights)
+        else:
+            m_weights = np.full(self.n_committees, 1.0 / float(self.n_committees), dtype=float)
+
+        committee_soft = m_weights @ all_scores
+        vote_rate = hard_votes / float(self.n_committees)
+        committee_pure = _min_max_scale(0.70 * _min_max_scale(committee_soft) + 0.30 * vote_rate)
+
+        self.committee_std_ = np.std(all_scores, axis=0)
+        se_vec = self.committee_std_ / np.sqrt(float(self.n_committees))
+        self.mean_se_ = float(np.mean(se_vec))
+
+        if self.anchor_weight > 0.0:
+            final_score = _min_max_scale((1.0 - self.anchor_weight) * committee_pure + self.anchor_weight * anchor_scores)
+        else:
+            final_score = committee_pure
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_comite_profundo': np.round(final_score, 5),
+            'escore_comite_puro': np.round(committee_pure, 5),
+            'escore_ancora': np.round(anchor_scores, 5),
+            'votos_hard': hard_votes.astype(int),
+            'taxa_consenso_pct': np.round(vote_rate * 100.0, 2),
+            'incerteza_se': np.round(se_vec, 6),
+        }).sort_values(['escore_comite_profundo', 'escore_comite_puro', 'dezena'], ascending=[False, False, True]).reset_index(drop=True)
+
+        self.top_k_ = self.predict_top_k(k_ballot, voting=self.voting) if k > 0 else []
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None, voting: Optional[str] = None) -> List[int]:
+        """Retorna as top K dezenas segundo o critério de votação do Comitê Profundo."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = len(self.top_k_) if self.top_k_ is not None else 6
+        if k <= 0:
+            return []
+        k = min(k, len(self.scores_df_))
+
+        use_voting = voting or self.voting
+        if use_voting == 'hard':
+            df_sorted = self.scores_df_.sort_values(
+                ['votos_hard', 'escore_comite_profundo', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'soft':
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_comite_puro', 'escore_comite_profundo', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'hybrid':
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_comite_profundo', 'votos_hard', 'dezena'], ascending=[False, False, True]
+            )
+        else:
+            raise ValueError(f"voting deve ser 'soft', 'hard' ou 'hybrid'. Recebido: {use_voting}")
+
+        return sorted([int(x) for x in df_sorted.head(k)['dezena'].tolist()])
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com os escores do Comitê Profundo."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+LotteryHighCommitteeBootstrappedMetaModel = LotteryDeepEnsembleCommitteeModel
 
 
 
@@ -8648,9 +9488,119 @@ def predict_dual_logit_gb_ensemble(binary_matrix: np.ndarray,
 
     )
 
-    model.fit(binary_matrix, cfg=cfg)
-
-    return model.predict_top_k(k_actual)
+    model.fit(binary_matrix, cfg=cfg)
+
+    return model.predict_top_k(k_actual)
+
+
+def predict_pretrained_meta_committee(binary_matrix: np.ndarray,
+                                    cfg: Dict,
+                                    k: Optional[int] = None,
+                                    n_committees: int = 100,
+                                    subspace_ratio: float = 0.65,
+                                    include_sub_estimators: bool = True,
+                                    dirichlet_alpha: float = 1.5,
+                                    voting: str = 'hybrid',
+                                    trained_ensembles: Optional[Dict[str, Any]] = None,
+                                    random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Meta-Comitê de Ensembles Pré-Treinados (Método 35, padrão M=100)."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryPretrainedMetaCommitteeModel(
+        n_committees=n_committees,
+        subspace_ratio=subspace_ratio,
+        include_sub_estimators=include_sub_estimators,
+        dirichlet_alpha=dirichlet_alpha,
+        voting=voting,
+        random_state=random_state,
+    )
+    model.fit(binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles)
+    return model.predict_top_k(k_actual)
+
+
+def predict_deep_ensemble_committee(binary_matrix: np.ndarray,
+                                    cfg: Dict,
+                                    k: Optional[int] = None,
+                                    n_committees: int = 100,
+                                    max_samples: float = 0.85,
+                                    anchor_weight: float = 0.30,
+                                    weight_by_oob: bool = True,
+                                    voting: str = 'hybrid',
+                                    trained_ensembles: Optional[Dict[str, Any]] = None,
+                                    random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Comitê Profundo Multi-Família Re-Estimado (Método 36, padrão M=100)."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryDeepEnsembleCommitteeModel(
+        n_committees=n_committees,
+        max_samples=max_samples,
+        anchor_weight=anchor_weight,
+        weight_by_oob=weight_by_oob,
+        voting=voting,
+        random_state=random_state,
+    )
+    model.fit(binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles)
+    return model.predict_top_k(k_actual)
+
+
+def compare_committee_sizes(binary_matrix: np.ndarray,
+                            cfg: Dict,
+                            sizes: Tuple[int, ...] = (10, 50, 100),
+                            trained_ensembles: Optional[Dict[str, Any]] = None,
+                            random_state: int = 42) -> pd.DataFrame:
+    """
+    Compara empiricamente diferentes tamanhos de comitê (ex.: M=10, M=50, M=100)
+    para os dois Meta-Ensembles (Meta-Comitê Pré-Treinado e Comitê Profundo Multi-Família),
+    reportando score OOB, erro padrão do escore (SE), estabilidade Jaccard e tempo de treino.
+    """
+    import time
+    if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+        raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+    sizes_list = [int(s) for s in sizes]
+    if not sizes_list or any(s <= 0 for s in sizes_list):
+        raise ValueError(f"sizes deve conter ao menos um inteiro positivo (> 0). Recebido: {sizes}")
+
+    k = int(cfg.get('k', 6))
+    rows = []
+
+    if trained_ensembles is None:
+        m_temp = LotteryPretrainedMetaCommitteeModel(n_committees=10, random_state=random_state)
+        trained_ensembles = m_temp._fit_default_base_ensembles(binary_matrix, cfg)
+
+    for m_size in sizes_list:
+        t0 = time.perf_counter()
+        m_meta = LotteryPretrainedMetaCommitteeModel(
+            n_committees=m_size, random_state=random_state
+        ).fit(binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles)
+        dt_meta = time.perf_counter() - t0
+        tail_jacc_meta = float(np.mean([c['top_k_jaccard'] for c in m_meta.convergence_curve_[-min(10, len(m_meta.convergence_curve_)):]]))
+
+        rows.append({
+            'Arquitetura': 'Meta-Comitê Pré-Treinado',
+            'n_committees': int(m_size),
+            'top_k': m_meta.predict_top_k(k),
+            'oob_score': np.nan,
+            'mean_se': round(m_meta.mean_se_, 6),
+            'tail_jaccard_stability': round(tail_jacc_meta, 4),
+            'fit_time_s': round(dt_meta, 4),
+        })
+
+        t1 = time.perf_counter()
+        m_deep = LotteryDeepEnsembleCommitteeModel(
+            n_committees=m_size, random_state=random_state
+        ).fit(binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles)
+        dt_deep = time.perf_counter() - t1
+        tail_jacc_deep = float(np.mean([c['top_k_jaccard'] for c in m_deep.convergence_curve_[-min(10, len(m_deep.convergence_curve_)):]]))
+
+        rows.append({
+            'Arquitetura': 'Comitê Profundo Multi-Família',
+            'n_committees': int(m_size),
+            'top_k': m_deep.predict_top_k(k),
+            'oob_score': round(m_deep.oob_score_, 4),
+            'mean_se': round(m_deep.mean_se_, 6),
+            'tail_jaccard_stability': round(tail_jacc_deep, 4),
+            'fit_time_s': round(dt_deep, 4),
+        })
+
+    return pd.DataFrame(rows)
 
 
 
@@ -9060,221 +10010,260 @@ def run_all_lottery_methods(filepath: str,
 
 
 
-    m_dual_logit_gb = LotteryDualLogitGBEnsembleModel(n_estimators_bagged=10, weight_base=0.45, random_state=42)
-
-    m_dual_logit_gb.fit(binary_matrix, cfg=cfg, base_model=m_logit_gb, bagged_model=m_bagged_logit_gb)
-
-    pred_dual_logit_gb = m_dual_logit_gb.predict_top_k(k)
-
-
-
-    predictions_ensemble = {
-
-        'Ensemble Bagging': pred_bagging,
-
-        'Ensemble Pasting': pred_pasting,
-
-        'Ensemble AdaBoost': pred_adaboost,
-
-        'Ensemble Gradient Boosting': pred_gradboost,
-
-        'Ensemble Stochastic Gradient Boosting': pred_stoch_gb,
-
-        'Ensemble Logit Gradient Boosting': pred_logit_gb,
-
-        'Ensemble Residual Cycling Gradient Boosting': pred_cycle_gb,
-
-        'Ensemble Stacking': pred_stacking,
-
-        'Ensemble Frequência/Atraso Momentum': pred_mom_ens,
-
-        'Ensemble Frequência/Atraso Balanceado': pred_bal_ens,
-
-        'Ensemble Batch Gradient Descent': pred_batch_gd,
-
-        'Ensemble Mini-Batch Gradient Descent': pred_minibatch_gd,
-
-        'Ensemble Stochastic Gradient Descent': pred_stoch_gd,
-
-        'Ensemble Bagged Logit Gradient Boosting': pred_bagged_logit_gb,
-
-        'Ensemble Dual Logit Gradient Boosting': pred_dual_logit_gb
-
-    }
-
-
-
-    predictions = {
-
-        'Metodo 1 (Estatistico - Balanceado)': pred_m1,
-
-        'Metodo 1 (Sub-estrategia Mais Atrasadas)': pred_m1_overdue,
-
-        'Metodo 1 (Sub-estrategia Mais Frequentes Recentes)': pred_m1_momentum,
-
-        'Metodo 2 (Machine Learning Multi-label Calibrado)': pred_m2,
-
-        'Metodo 3 (Bayesiano Conjugado Global)': pred_m3_static,
-
-        'Metodo 3 (Bayesiano Dinamico Adaptativo)': pred_m3_dyn,
-
-        'Metodo 4 (Gianella - Geometria do Acaso)': pred_m4
-
-    }
-
-
-
-    if include_hybrids:
-
-        predictions['Decisao Otima de Bayes (Consenso)'] = pred_consenso
-
-        predictions['Metodo 5 (Gianella + Bayes Global)'] = pred_g_bayes_global
-
-        predictions['Metodo 6 (Gianella + Bayes Adaptativo)'] = pred_g_bayes_adaptive
-
-        predictions['Metodo 7 (Gianella + Melhor Decisao de Bayes)'] = pred_g_best_bayes
-
-        predictions['Metodo 8 (Gianella + Regressao Logistica)'] = pred_g_lr
-
-        predictions['Metodo 9 (Gianella + Freq/Atraso Momentum)'] = pred_g_mom
-
-        predictions['Metodo 10 (Gianella + Freq/Atraso Balanceado)'] = pred_g_bal
-
-        predictions['Metodo 11 (Melhor Decisao Bayes + Regressao Logistica)'] = pred_bb_lr
-
-        predictions['Metodo 12 (Melhor Decisao Bayes + Freq/Atraso Momentum)'] = pred_bb_mom
-
-        predictions['Metodo 13 (Melhor Decisao Bayes + Freq/Atraso Balanceado)'] = pred_bb_bal
-
-        predictions['Metodo 14 (Bayes Global + Regressao Logistica)'] = pred_bg_lr
-
-        predictions['Metodo 15 (Bayes Global + Frequencia/Atraso Momentum)'] = pred_bg_mom
-
-        predictions['Metodo 16 (Bayes Global + Frequencia/Atraso Balanceado)'] = pred_bg_bal
-
-        predictions['Metodo 17 (Bayes Adaptativo + Regressao Logistica)'] = pred_ba_lr
-
-        predictions['Metodo 18 (Bayes Adaptativo + Frequencia/Atraso Momentum)'] = pred_ba_mom
-
-        predictions['Metodo 19 (Bayes Adaptativo + Frequencia/Atraso Balanceado)'] = pred_ba_bal
-
-
-
-    if include_ensembles:
-
-        predictions['Metodo 20 (Ensemble Bagging - Bootstrap Aggregating)'] = pred_bagging
-
-        predictions['Metodo 21 (Ensemble Pasting - Non-replacement Aggregating)'] = pred_pasting
-
-        predictions['Metodo 22 (Ensemble AdaBoost - Adaptive Boosting)'] = pred_adaboost
-
-        predictions['Metodo 23 (Ensemble Gradient Boosting - Residual Boosting)'] = pred_gradboost
-
-        predictions['Metodo 24 (Ensemble Stochastic Gradient Boosting - Subsample)'] = pred_stoch_gb
-
-        predictions['Metodo 25 (Ensemble Logit Gradient Boosting - Binomial Deviance)'] = pred_logit_gb
-
-        predictions['Metodo 26 (Ensemble Residual Cycling Gradient Boosting - Multi-Model Residual)'] = pred_cycle_gb
-
-        predictions['Metodo 27 (Ensemble Stacking - Stacked Generalization)'] = pred_stacking
-
-        predictions['Metodo 28 (Ensemble Frequencia/Atraso Momentum - Multi-Janela)'] = pred_mom_ens
-
-        predictions['Metodo 29 (Ensemble Frequencia/Atraso Balanceado - Multi-Escala)'] = pred_bal_ens
-
-        predictions['Metodo 30 (Ensemble Batch Gradient Descent - Full Batch GD)'] = pred_batch_gd
-
-        predictions['Metodo 31 (Ensemble Mini-Batch Gradient Descent - Mini-Batch GD)'] = pred_minibatch_gd
-
-        predictions['Metodo 32 (Ensemble Stochastic Gradient Descent - Online SGD)'] = pred_stoch_gd
-
-        predictions['Metodo 33 (Ensemble Bagged Logit Gradient Boosting - Meta-Ensemble)'] = pred_bagged_logit_gb
-        predictions['Metodo 34 (Ensemble Dual Logit Gradient Boosting - Fusão Hierárquica)'] = pred_dual_logit_gb
-
-
-
-    comparison_records = []
-
-    for name, nums in predictions.items():
-
-        comparison_records.append({
-
-            'Metodo': name,
-
-            'Proximo Concurso': next_concurso,
-
-            'Dezenas Previstas': ', '.join(f'{n:02d}' for n in nums),
-
-            'Lista Dezenas': nums
-
-        })
-
-    comparison_df = pd.DataFrame(comparison_records)
-
-
-
-    return {
-
-        'df_raw': df,
-
-        'binary_matrix': binary_matrix,
-
-        'cfg': cfg,
-
-        'm1_model': m1,
-
-        'm2_model': m2,
-
-        'm3_static': m3_static,
-
-        'm3_dyn': m3_dyn,
-
-        'm4_gianella': m4,
-
-        'm_hybrid': m_hybrid,
-
-        'm_bagging': m_bagging,
-
-        'm_pasting': m_pasting,
-
-        'm_adaboost': m_adaboost,
-
-        'm_gradboost': m_gradboost,
-
-        'm_stoch_gb': m_stoch_gb,
-
-        'm_logit_gb': m_logit_gb,
-
-        'm_cycle_gb': m_cycle_gb,
-
-        'm_stacking': m_stacking,
-
-        'm_mom_ens': m_mom_ens,
-
-        'm_bal_ens': m_bal_ens,
-
-        'm_batch_gd': m_batch_gd,
-
-        'm_minibatch_gd': m_minibatch_gd,
-
-        'm_stoch_gd': m_stoch_gd,
-
-        'm_bagged_logit_gb': m_bagged_logit_gb,
-
-        'm_dual_logit_gb': m_dual_logit_gb,
-
-        'pred_consenso': pred_consenso,
-
-        'consensus_scores': ball_scores,
-
-        'predictions': predictions,
-
-        'predictions_hybrid': predictions_hybrid,
-
-        'predictions_ensemble': predictions_ensemble,
-
-        'comparison_df': comparison_df
-
+    m_dual_logit_gb = LotteryDualLogitGBEnsembleModel(n_estimators_bagged=10, weight_base=0.45, random_state=42)
+
+    m_dual_logit_gb.fit(binary_matrix, cfg=cfg, base_model=m_logit_gb, bagged_model=m_bagged_logit_gb)
+
+    pred_dual_logit_gb = m_dual_logit_gb.predict_top_k(k)
+
+    # 7. Novos Meta-Ensembles de Alto Comitê (M=100 padrão) baseados nos Ensembles já treinados
+    trained_ensembles_dict = {
+        'bagging': m_bagging,
+        'pasting': m_pasting,
+        'adaboost': m_adaboost,
+        'gradboost': m_gradboost,
+        'stoch_gb': m_stoch_gb,
+        'logit_gb': m_logit_gb,
+        'cycle_gb': m_cycle_gb,
+        'stacking': m_stacking,
+        'mom_ens': m_mom_ens,
+        'bal_ens': m_bal_ens,
+        'batch_gd': m_batch_gd,
+        'minibatch_gd': m_minibatch_gd,
+        'stoch_gd': m_stoch_gd,
+        'bagged_logit_gb': m_bagged_logit_gb,
+        'dual_logit_gb': m_dual_logit_gb,
+    }
+
+    m_meta_committee_100 = LotteryPretrainedMetaCommitteeModel(n_committees=100, random_state=42)
+    m_meta_committee_100.fit(binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles_dict)
+    pred_meta_committee_100 = m_meta_committee_100.predict_top_k(k)
+
+    m_deep_committee_100 = LotteryDeepEnsembleCommitteeModel(n_committees=100, random_state=42)
+    m_deep_committee_100.fit(binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles_dict)
+    pred_deep_committee_100 = m_deep_committee_100.predict_top_k(k)
+
+
+
+    predictions_ensemble = {
+
+        'Ensemble Bagging': pred_bagging,
+
+        'Ensemble Pasting': pred_pasting,
+
+        'Ensemble AdaBoost': pred_adaboost,
+
+        'Ensemble Gradient Boosting': pred_gradboost,
+
+        'Ensemble Stochastic Gradient Boosting': pred_stoch_gb,
+
+        'Ensemble Logit Gradient Boosting': pred_logit_gb,
+
+        'Ensemble Residual Cycling Gradient Boosting': pred_cycle_gb,
+
+        'Ensemble Stacking': pred_stacking,
+
+        'Ensemble Frequência/Atraso Momentum': pred_mom_ens,
+
+        'Ensemble Frequência/Atraso Balanceado': pred_bal_ens,
+
+        'Ensemble Batch Gradient Descent': pred_batch_gd,
+
+        'Ensemble Mini-Batch Gradient Descent': pred_minibatch_gd,
+
+        'Ensemble Stochastic Gradient Descent': pred_stoch_gd,
+
+        'Ensemble Bagged Logit Gradient Boosting': pred_bagged_logit_gb,
+
+        'Ensemble Dual Logit Gradient Boosting': pred_dual_logit_gb,
+
+        'Ensemble Meta-Comitê Pré-Treinado (M=100)': pred_meta_committee_100,
+
+        'Ensemble Comitê Profundo Multi-Família (M=100)': pred_deep_committee_100
+
+    }
+
+
+
+    predictions = {
+
+        'Metodo 1 (Estatistico - Balanceado)': pred_m1,
+
+        'Metodo 1 (Sub-estrategia Mais Atrasadas)': pred_m1_overdue,
+
+        'Metodo 1 (Sub-estrategia Mais Frequentes Recentes)': pred_m1_momentum,
+
+        'Metodo 2 (Machine Learning Multi-label Calibrado)': pred_m2,
+
+        'Metodo 3 (Bayesiano Conjugado Global)': pred_m3_static,
+
+        'Metodo 3 (Bayesiano Dinamico Adaptativo)': pred_m3_dyn,
+
+        'Metodo 4 (Gianella - Geometria do Acaso)': pred_m4
+
+    }
+
+
+
+    if include_hybrids:
+
+        predictions['Decisao Otima de Bayes (Consenso)'] = pred_consenso
+
+        predictions['Metodo 5 (Gianella + Bayes Global)'] = pred_g_bayes_global
+
+        predictions['Metodo 6 (Gianella + Bayes Adaptativo)'] = pred_g_bayes_adaptive
+
+        predictions['Metodo 7 (Gianella + Melhor Decisao de Bayes)'] = pred_g_best_bayes
+
+        predictions['Metodo 8 (Gianella + Regressao Logistica)'] = pred_g_lr
+
+        predictions['Metodo 9 (Gianella + Freq/Atraso Momentum)'] = pred_g_mom
+
+        predictions['Metodo 10 (Gianella + Freq/Atraso Balanceado)'] = pred_g_bal
+
+        predictions['Metodo 11 (Melhor Decisao Bayes + Regressao Logistica)'] = pred_bb_lr
+
+        predictions['Metodo 12 (Melhor Decisao Bayes + Freq/Atraso Momentum)'] = pred_bb_mom
+
+        predictions['Metodo 13 (Melhor Decisao Bayes + Freq/Atraso Balanceado)'] = pred_bb_bal
+
+        predictions['Metodo 14 (Bayes Global + Regressao Logistica)'] = pred_bg_lr
+
+        predictions['Metodo 15 (Bayes Global + Frequencia/Atraso Momentum)'] = pred_bg_mom
+
+        predictions['Metodo 16 (Bayes Global + Frequencia/Atraso Balanceado)'] = pred_bg_bal
+
+        predictions['Metodo 17 (Bayes Adaptativo + Regressao Logistica)'] = pred_ba_lr
+
+        predictions['Metodo 18 (Bayes Adaptativo + Frequencia/Atraso Momentum)'] = pred_ba_mom
+
+        predictions['Metodo 19 (Bayes Adaptativo + Frequencia/Atraso Balanceado)'] = pred_ba_bal
+
+
+
+    if include_ensembles:
+
+        predictions['Metodo 20 (Ensemble Bagging - Bootstrap Aggregating)'] = pred_bagging
+
+        predictions['Metodo 21 (Ensemble Pasting - Non-replacement Aggregating)'] = pred_pasting
+
+        predictions['Metodo 22 (Ensemble AdaBoost - Adaptive Boosting)'] = pred_adaboost
+
+        predictions['Metodo 23 (Ensemble Gradient Boosting - Residual Boosting)'] = pred_gradboost
+
+        predictions['Metodo 24 (Ensemble Stochastic Gradient Boosting - Subsample)'] = pred_stoch_gb
+
+        predictions['Metodo 25 (Ensemble Logit Gradient Boosting - Binomial Deviance)'] = pred_logit_gb
+
+        predictions['Metodo 26 (Ensemble Residual Cycling Gradient Boosting - Multi-Model Residual)'] = pred_cycle_gb
+
+        predictions['Metodo 27 (Ensemble Stacking - Stacked Generalization)'] = pred_stacking
+
+        predictions['Metodo 28 (Ensemble Frequencia/Atraso Momentum - Multi-Janela)'] = pred_mom_ens
+
+        predictions['Metodo 29 (Ensemble Frequencia/Atraso Balanceado - Multi-Escala)'] = pred_bal_ens
+
+        predictions['Metodo 30 (Ensemble Batch Gradient Descent - Full Batch GD)'] = pred_batch_gd
+
+        predictions['Metodo 31 (Ensemble Mini-Batch Gradient Descent - Mini-Batch GD)'] = pred_minibatch_gd
+
+        predictions['Metodo 32 (Ensemble Stochastic Gradient Descent - Online SGD)'] = pred_stoch_gd
+
+        predictions['Metodo 33 (Ensemble Bagged Logit Gradient Boosting - Meta-Ensemble)'] = pred_bagged_logit_gb
+        predictions['Metodo 34 (Ensemble Dual Logit Gradient Boosting - Fusão Hierárquica)'] = pred_dual_logit_gb
+
+        predictions['Metodo 35 (Ensemble Meta-Comitê Pré-Treinado - M=100)'] = pred_meta_committee_100
+
+        predictions['Metodo 36 (Ensemble Comitê Profundo Multi-Família - M=100)'] = pred_deep_committee_100
+
+
+
+    comparison_records = []
+
+    for name, nums in predictions.items():
+
+        comparison_records.append({
+
+            'Metodo': name,
+
+            'Proximo Concurso': next_concurso,
+
+            'Dezenas Previstas': ', '.join(f'{n:02d}' for n in nums),
+
+            'Lista Dezenas': nums
+
+        })
+
+    comparison_df = pd.DataFrame(comparison_records)
+
+
+
+    return {
+
+        'df_raw': df,
+
+        'binary_matrix': binary_matrix,
+
+        'cfg': cfg,
+
+        'm1_model': m1,
+
+        'm2_model': m2,
+
+        'm3_static': m3_static,
+
+        'm3_dyn': m3_dyn,
+
+        'm4_gianella': m4,
+
+        'm_hybrid': m_hybrid,
+
+        'm_bagging': m_bagging,
+
+        'm_pasting': m_pasting,
+
+        'm_adaboost': m_adaboost,
+
+        'm_gradboost': m_gradboost,
+
+        'm_stoch_gb': m_stoch_gb,
+
+        'm_logit_gb': m_logit_gb,
+
+        'm_cycle_gb': m_cycle_gb,
+
+        'm_stacking': m_stacking,
+
+        'm_mom_ens': m_mom_ens,
+
+        'm_bal_ens': m_bal_ens,
+
+        'm_batch_gd': m_batch_gd,
+
+        'm_minibatch_gd': m_minibatch_gd,
+
+        'm_stoch_gd': m_stoch_gd,
+
+        'm_bagged_logit_gb': m_bagged_logit_gb,
+
+        'm_dual_logit_gb': m_dual_logit_gb,
+
+        'm_meta_committee_100': m_meta_committee_100,
+
+        'm_deep_committee_100': m_deep_committee_100,
+
+        'pred_consenso': pred_consenso,
+
+        'consensus_scores': ball_scores,
+
+        'predictions': predictions,
+
+        'predictions_hybrid': predictions_hybrid,
+
+        'predictions_ensemble': predictions_ensemble,
+
+        'comparison_df': comparison_df
+
     }
 
 

@@ -72,9 +72,25 @@ from mega_sena_models import (
 
     LotteryDualLogitGBEnsembleModel,
 
+    LotteryPretrainedMetaCommitteeModel,
+
+    LotterySuperEnsembleCommitteeModel,
+
+    LotteryDeepEnsembleCommitteeModel,
+
+    LotteryHighCommitteeBootstrappedMetaModel,
+
     predict_bagged_logit_gb_ensemble,
 
     predict_dual_logit_gb_ensemble,
+
+    predict_pretrained_meta_committee,
+
+    predict_deep_ensemble_committee,
+
+    compare_committee_sizes,
+
+    _extract_trained_ensemble_signals,
 
     predict_batch_gd_ensemble,
 
@@ -1456,6 +1472,417 @@ class TestModelsExecution:
 
 
 
+    def test_lottery_pretrained_meta_committee_model(self, synthetic_data):
+
+        cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
+
+        # Pre-train compact ensembles to test direct reuse
+
+        pre_lgb = LotteryLogitGradientBoostingModel(n_estimators=4, learning_rate=0.25, random_state=42).fit(synthetic_data, cfg)
+
+        pre_rcgb = LotteryResidualCyclingGradientBoostingModel(n_estimators=4, random_state=42).fit(synthetic_data, cfg)
+
+        pre_mom = LotteryMomentumEnsembleModel(n_estimators=4, random_state=42).fit(synthetic_data, cfg)
+
+        pre_bal = LotteryBalancedEnsembleModel(n_estimators=4, random_state=42).fit(synthetic_data, cfg)
+
+        trained_dict = {
+
+            'Logit GB': pre_lgb,
+
+            'Residual Cycling GB': pre_rcgb,
+
+            'Momentum Ensemble': pre_mom,
+
+            'Balanced Ensemble': pre_bal,
+
+        }
+
+        m50 = LotteryPretrainedMetaCommitteeModel(n_committees=50, random_state=42).fit(
+            synthetic_data, cfg, trained_ensembles=trained_dict
+        )
+
+        m100 = LotterySuperEnsembleCommitteeModel(n_committees=100, random_state=42).fit(
+            synthetic_data, cfg, trained_ensembles=trained_dict
+        )
+
+        assert m50.n_committees == 50
+
+        assert m100.n_committees == 100
+
+        assert len(m50.base_ensemble_names_) == 4
+
+        assert m50.sub_estimator_count_ >= 4
+
+        assert len(m50.committee_members_) == 50
+
+        assert len(m100.committee_members_) == 100
+
+        assert len(m50.convergence_curve_) == 50
+
+        assert len(m100.convergence_curve_) == 100
+
+        assert sum(m50.ensemble_contributions_.values()) == pytest.approx(1.0, abs=1e-4)
+
+        assert np.isfinite(m50.mean_se_) and np.isfinite(m100.mean_se_)
+
+        assert m100.mean_se_ <= m50.mean_se_ * 1.15 + 1e-6
+
+        for voting_mode in ('hybrid', 'soft', 'borda', 'hard'):
+
+            bet50 = m50.predict_top_k(6, voting=voting_mode)
+
+            bet100 = m100.predict_top_k(6, voting=voting_mode)
+
+            assert len(bet50) == 6 and len(set(bet50)) == 6
+
+            assert len(bet100) == 6 and len(set(bet100)) == 6
+
+            assert all(1 <= d <= 60 for d in bet50 + bet100)
+
+        df_scores = m100.get_scores_df()
+
+        assert len(df_scores) == 60
+
+        for col in ['dezena', 'escore_meta_comite', 'probabilidade_comite', 'escore_soft', 'escore_borda', 'votos_hard', 'taxa_consenso_pct', 'incerteza_se']:
+
+            assert col in df_scores.columns
+
+        # Determinism check
+
+        m50_dup = LotteryPretrainedMetaCommitteeModel(n_committees=50, random_state=42).fit(
+            synthetic_data, cfg, trained_ensembles=trained_dict
+        )
+
+        assert m50.predict_top_k(6) == m50_dup.predict_top_k(6)
+
+        # Standalone mode (trained_ensembles=None)
+
+        m50_standalone = LotteryPretrainedMetaCommitteeModel(n_committees=50, random_state=42).fit(
+            synthetic_data, cfg, trained_ensembles=None
+        )
+
+        assert len(m50_standalone.base_ensemble_names_) >= 3
+
+        assert len(m50_standalone.predict_top_k(6)) == 6
+
+        # Multi-lottery shapes (Lotofacil 25/15 and Quina 80/5)
+
+        rng = np.random.RandomState(99)
+
+        mat_lf = np.zeros((40, 25), dtype=int)
+
+        for i in range(40):
+
+            mat_lf[i, rng.choice(25, size=15, replace=False)] = 1
+
+        cfg_lf = {'k': 15, 'n_dezenas': 25, 'alpha_0': 1.0, 'beta_0': 1.0, 'gianella_group_size': 5}
+
+        lf_m50 = LotteryPretrainedMetaCommitteeModel(n_committees=50, random_state=7).fit(mat_lf, cfg_lf)
+
+        assert len(lf_m50.predict_top_k(15)) == 15
+
+        mat_qn = np.zeros((40, 80), dtype=int)
+
+        for i in range(40):
+
+            mat_qn[i, rng.choice(80, size=5, replace=False)] = 1
+
+        cfg_qn = {'k': 5, 'n_dezenas': 80, 'alpha_0': 1.0, 'beta_0': 15.0, 'gianella_group_size': 10}
+
+        qn_m50 = LotteryPretrainedMetaCommitteeModel(n_committees=50, random_state=7).fit(mat_qn, cfg_qn)
+
+        assert len(qn_m50.predict_top_k(5)) == 5
+
+        # Edge cases: small sample & zero matrix
+
+        small_m = LotteryPretrainedMetaCommitteeModel(n_committees=50, random_state=42).fit(synthetic_data[:5], cfg)
+
+        assert len(small_m.predict_top_k(6)) == 6
+
+        one_m = LotteryPretrainedMetaCommitteeModel(n_committees=10, random_state=42).fit(synthetic_data[:1], cfg)
+
+        assert len(one_m.predict_top_k(6)) == 6
+
+        zero_m = LotteryPretrainedMetaCommitteeModel(n_committees=50, random_state=42).fit(np.zeros((20, 60), dtype=int), cfg)
+
+        assert len(zero_m.predict_top_k(6)) == 6
+
+        # Regression: top_k_ must respect configured self.voting across all modes
+
+        for v_mode in ('hybrid', 'soft', 'borda', 'hard'):
+
+            mv = LotteryPretrainedMetaCommitteeModel(n_committees=30, voting=v_mode, random_state=42).fit(
+                synthetic_data, cfg, trained_ensembles=trained_dict
+            )
+
+            assert mv.top_k_ == mv.predict_top_k(6)
+
+        # Regression: temperature_range actively modulates thermodynamic calibration in hybrid scores
+
+        m_cold = LotteryPretrainedMetaCommitteeModel(
+            n_committees=30, temperature_range=(0.05, 0.10), random_state=42
+        ).fit(synthetic_data, cfg, trained_ensembles=trained_dict)
+
+        m_hot = LotteryPretrainedMetaCommitteeModel(
+            n_committees=30, temperature_range=(5.0, 10.0), random_state=42
+        ).fit(synthetic_data, cfg, trained_ensembles=trained_dict)
+
+        df_c = m_cold.get_scores_df().sort_values('dezena')['escore_meta_comite'].values
+
+        df_h = m_hot.get_scores_df().sort_values('dezena')['escore_meta_comite'].values
+
+        assert float(np.max(np.abs(df_c - df_h))) > 1e-3
+
+        # Regression: ensembles lacking oob_score_ receive neutral prior rather than 0.0 penalty
+
+        _, _, oob_mixed, _, _ = _extract_trained_ensemble_signals(
+            {'Logit GB': pre_lgb, 'Momentum Ensemble': pre_mom}, 60, include_sub_estimators=True
+        )
+
+        assert len(oob_mixed) == 2 and oob_mixed[0] == pytest.approx(0.5, abs=1e-6) and oob_mixed[1] == pytest.approx(0.5, abs=1e-6)
+
+        # Error checks
+
+        with pytest.raises(RuntimeError):
+
+            LotteryPretrainedMetaCommitteeModel(n_committees=50).predict_top_k(6)
+
+        with pytest.raises(ValueError):
+
+            LotteryPretrainedMetaCommitteeModel(n_committees=50).fit(np.zeros((0, 60)))
+
+        with pytest.raises(ValueError):
+
+            LotteryPretrainedMetaCommitteeModel(n_committees=0).fit(synthetic_data, cfg)
+
+        with pytest.raises(ValueError):
+
+            m50.predict_top_k(6, voting='invalid_mode')
+
+
+
+    def test_lottery_deep_ensemble_committee_model(self, synthetic_data):
+
+        cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
+
+        pre_lgb = LotteryLogitGradientBoostingModel(n_estimators=4, learning_rate=0.25, random_state=42).fit(synthetic_data, cfg)
+
+        pre_mom = LotteryMomentumEnsembleModel(n_estimators=4, random_state=42).fit(synthetic_data, cfg)
+
+        trained_dict = {'Logit GB': pre_lgb, 'Momentum Ensemble': pre_mom}
+
+        d50 = LotteryDeepEnsembleCommitteeModel(n_committees=50, random_state=42).fit(
+            synthetic_data, cfg, trained_ensembles=trained_dict
+        )
+
+        d100 = LotteryHighCommitteeBootstrappedMetaModel(n_committees=100, random_state=42).fit(
+            synthetic_data, cfg, trained_ensembles=trained_dict
+        )
+
+        assert len(d50.estimators_) == 50
+
+        assert len(d100.estimators_) == 100
+
+        assert len(d50.convergence_curve_) == 50
+
+        assert len(d100.convergence_curve_) == 100
+
+        assert d50.oob_score_ is not None and 0.0 <= d50.oob_score_ <= 6.0
+
+        assert d100.oob_score_ is not None and 0.0 <= d100.oob_score_ <= 6.0
+
+        assert len(d50.family_oob_scores_) >= 2
+
+        assert np.isfinite(d50.mean_se_) and np.isfinite(d100.mean_se_)
+
+        assert d100.mean_se_ <= d50.mean_se_ * 1.15 + 1e-6
+
+        for voting_mode in ('hybrid', 'soft', 'hard'):
+
+            bet50 = d50.predict_top_k(6, voting=voting_mode)
+
+            bet100 = d100.predict_top_k(6, voting=voting_mode)
+
+            assert len(bet50) == 6 and len(set(bet50)) == 6
+
+            assert len(bet100) == 6 and len(set(bet100)) == 6
+
+            assert all(1 <= d <= 60 for d in bet50 + bet100)
+
+        # Regression: top_k_ must respect configured self.voting across all modes
+
+        for v_mode in ('hybrid', 'soft', 'hard'):
+
+            dv = LotteryDeepEnsembleCommitteeModel(n_committees=24, voting=v_mode, random_state=42).fit(
+                synthetic_data, cfg, trained_ensembles=trained_dict
+            )
+
+            assert dv.top_k_ == dv.predict_top_k(6)
+
+        df_scores = d100.get_scores_df()
+
+        assert len(df_scores) == 60
+
+        for col in ['dezena', 'escore_comite_profundo', 'escore_comite_puro', 'escore_ancora', 'votos_hard', 'taxa_consenso_pct', 'incerteza_se']:
+
+            assert col in df_scores.columns
+
+        # Determinism check
+
+        d50_dup = LotteryDeepEnsembleCommitteeModel(n_committees=50, random_state=42).fit(
+            synthetic_data, cfg, trained_ensembles=trained_dict
+        )
+
+        assert d50.predict_top_k(6) == d50_dup.predict_top_k(6)
+
+        # Standalone mode without anchor
+
+        d50_no_anchor = LotteryDeepEnsembleCommitteeModel(
+            n_committees=50, anchor_weight=0.0, oob_score=False, random_state=42
+        ).fit(synthetic_data, cfg, trained_ensembles=None)
+
+        assert len(d50_no_anchor.predict_top_k(6)) == 6
+
+        # Multi-lottery shapes (Lotofacil 25/15 & Quina 80/5)
+
+        rng = np.random.RandomState(101)
+
+        mat_lf = np.zeros((40, 25), dtype=int)
+
+        for i in range(40):
+
+            mat_lf[i, rng.choice(25, size=15, replace=False)] = 1
+
+        cfg_lf = {'k': 15, 'n_dezenas': 25, 'alpha_0': 1.0, 'beta_0': 1.0, 'gianella_group_size': 5}
+
+        lf_deep = LotteryDeepEnsembleCommitteeModel(n_committees=50, random_state=7).fit(mat_lf, cfg_lf)
+
+        assert len(lf_deep.predict_top_k(15)) == 15
+
+        assert 0.0 <= lf_deep.oob_score_ <= 15.0
+
+        mat_qn = np.zeros((40, 80), dtype=int)
+
+        for i in range(40):
+
+            mat_qn[i, rng.choice(80, size=5, replace=False)] = 1
+
+        cfg_qn = {'k': 5, 'n_dezenas': 80, 'alpha_0': 1.0, 'beta_0': 15.0, 'gianella_group_size': 10}
+
+        qn_deep = LotteryDeepEnsembleCommitteeModel(n_committees=50, random_state=7).fit(mat_qn, cfg_qn)
+
+        assert len(qn_deep.predict_top_k(5)) == 5
+
+        assert 0.0 <= qn_deep.oob_score_ <= 5.0
+
+        # Edge cases: small sample, gd_bootstrap native vs n=1 fallback attribution, partial n_oob==0 & zero matrix
+
+        assert len(LotteryDeepEnsembleCommitteeModel(n_committees=50, random_state=42).fit(synthetic_data[:5], cfg).predict_top_k(6)) == 6
+
+        gd_n5 = LotteryDeepEnsembleCommitteeModel(
+            n_committees=6, families=['gd_bootstrap'], random_state=42
+        ).fit(synthetic_data[:5], cfg, trained_ensembles=trained_dict)
+
+        assert all(e['family'] == 'gd_bootstrap' for e in gd_n5.estimators_)
+
+        gd_n1 = LotteryDeepEnsembleCommitteeModel(
+            n_committees=4, families=['gd_bootstrap'], random_state=42
+        ).fit(synthetic_data[:1], cfg, trained_ensembles=trained_dict)
+
+        assert all(e['family'] == 'bayes_gianella_bootstrap' for e in gd_n1.estimators_)
+
+        d_oob_w = LotteryDeepEnsembleCommitteeModel(
+            n_committees=30, max_samples=1.0, weight_by_oob=True, random_state=42
+        ).fit(synthetic_data[:3], cfg, trained_ensembles=trained_dict)
+
+        d_oob_u = LotteryDeepEnsembleCommitteeModel(
+            n_committees=30, max_samples=1.0, weight_by_oob=False, random_state=42
+        ).fit(synthetic_data[:3], cfg, trained_ensembles=trained_dict)
+
+        assert float(np.max(np.abs(
+            d_oob_w.get_scores_df().sort_values('dezena')['escore_comite_puro'].values -
+            d_oob_u.get_scores_df().sort_values('dezena')['escore_comite_puro'].values
+        ))) > 1e-4
+
+        assert len(LotteryDeepEnsembleCommitteeModel(n_committees=50, random_state=42).fit(np.zeros((20, 60), dtype=int), cfg).predict_top_k(6)) == 6
+
+        # Error checks
+
+        with pytest.raises(RuntimeError):
+
+            LotteryDeepEnsembleCommitteeModel(n_committees=50).predict_top_k(6)
+
+        with pytest.raises(ValueError):
+
+            LotteryDeepEnsembleCommitteeModel(n_committees=50).fit(np.zeros((0, 60)))
+
+        with pytest.raises(ValueError):
+
+            LotteryDeepEnsembleCommitteeModel(n_committees=0).fit(synthetic_data, cfg)
+
+        with pytest.raises(ValueError):
+
+            LotteryDeepEnsembleCommitteeModel(n_committees=50, max_samples=1.5).fit(synthetic_data, cfg)
+
+        with pytest.raises(ValueError):
+
+            LotteryDeepEnsembleCommitteeModel(n_committees=50, anchor_weight=1.5).fit(synthetic_data, cfg)
+
+        with pytest.raises(ValueError):
+
+            d50.predict_top_k(6, voting='invalid_mode')
+
+
+
+    def test_compare_committee_sizes(self, synthetic_data):
+
+        cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
+
+        pre_lgb = LotteryLogitGradientBoostingModel(n_estimators=4, learning_rate=0.25, random_state=42).fit(synthetic_data, cfg)
+
+        pre_mom = LotteryMomentumEnsembleModel(n_estimators=4, random_state=42).fit(synthetic_data, cfg)
+
+        df_cmp = compare_committee_sizes(
+            synthetic_data,
+            cfg,
+            sizes=(10, 50, 100),
+            trained_ensembles={'Logit GB': pre_lgb, 'Momentum Ensemble': pre_mom},
+            random_state=42,
+        )
+
+        assert isinstance(df_cmp, pd.DataFrame)
+
+        assert len(df_cmp) == 6
+
+        assert set(df_cmp['n_committees'].tolist()) == {10, 50, 100}
+
+        assert df_cmp['Arquitetura'].nunique() == 2
+
+        for col in ['Arquitetura', 'n_committees', 'top_k', 'oob_score', 'mean_se', 'tail_jaccard_stability', 'fit_time_s']:
+
+            assert col in df_cmp.columns
+
+        assert all(len(tk) == 6 for tk in df_cmp['top_k'])
+
+        meta_rows = df_cmp[df_cmp['Arquitetura'].str.contains('Meta')].sort_values('n_committees')
+
+        assert meta_rows.iloc[-1]['mean_se'] <= meta_rows.iloc[0]['mean_se'] * 1.15 + 1e-6
+
+        with pytest.raises(ValueError):
+
+            compare_committee_sizes(synthetic_data, cfg, sizes=())
+
+        with pytest.raises(ValueError):
+
+            compare_committee_sizes(synthetic_data, cfg, sizes=(0, 50))
+
+        with pytest.raises(ValueError):
+
+            compare_committee_sizes(np.zeros((0, 60)), cfg, sizes=(50,))
+
+
+
     def test_ensemble_helper_functions(self, synthetic_data):
 
         cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
@@ -1492,6 +1919,34 @@ class TestModelsExecution:
 
         p_dual_lgb = predict_dual_logit_gb_ensemble(synthetic_data, cfg, k=6, n_estimators_bagged=3, base_n_iterations=3)
 
+        pre_dict = {
+
+            'Logit GB': LotteryLogitGradientBoostingModel(n_estimators=3, random_state=42).fit(synthetic_data, cfg),
+
+            'Momentum Ensemble': LotteryMomentumEnsembleModel(n_estimators=3, random_state=42).fit(synthetic_data, cfg),
+
+        }
+
+        p_meta_default = predict_pretrained_meta_committee(synthetic_data, cfg, k=6, trained_ensembles=pre_dict)
+
+        p_meta_50 = predict_pretrained_meta_committee(synthetic_data, cfg, k=6, n_committees=50, trained_ensembles=pre_dict)
+
+        p_meta_100 = predict_pretrained_meta_committee(synthetic_data, cfg, k=6, n_committees=100, trained_ensembles=pre_dict)
+
+        p_deep_default = predict_deep_ensemble_committee(synthetic_data, cfg, k=6, trained_ensembles=pre_dict)
+
+        p_deep_50 = predict_deep_ensemble_committee(synthetic_data, cfg, k=6, n_committees=50, trained_ensembles=pre_dict)
+
+        p_deep_100 = predict_deep_ensemble_committee(synthetic_data, cfg, k=6, n_committees=100, trained_ensembles=pre_dict)
+
+        assert p_meta_default == p_meta_100
+
+        assert p_deep_default == p_deep_100
+
+        assert LotteryPretrainedMetaCommitteeModel().n_committees == 100
+
+        assert LotteryDeepEnsembleCommitteeModel().n_committees == 100
+
 
 
         for name, bet in [('bagging', p_bag), ('pasting', p_paste), ('adaboost', p_ada),
@@ -1502,7 +1957,13 @@ class TestModelsExecution:
 
                           ('stacking', p_stack), ('momentum_ensemble', p_mom_ens), ('balanced_ensemble', p_bal_ens),
 
-                          ('batch_gd', p_batch_gd), ('minibatch_gd', p_minibatch_gd), ('stochastic_gd', p_stoch_gd), ('bagged_logit_gb', p_bagged_lgb), ('dual_logit_gb', p_dual_lgb)]:
+                          ('batch_gd', p_batch_gd), ('minibatch_gd', p_minibatch_gd), ('stochastic_gd', p_stoch_gd),
+
+                          ('bagged_logit_gb', p_bagged_lgb), ('dual_logit_gb', p_dual_lgb),
+
+                          ('pretrained_meta_50', p_meta_50), ('pretrained_meta_100', p_meta_100),
+
+                          ('deep_committee_50', p_deep_50), ('deep_committee_100', p_deep_100)]:
 
             assert len(bet) == 6, f"Tamanho incorreto para {name}"
 
@@ -1596,6 +2057,8 @@ class TestRunAllLotteryMethods:
 
                          'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd', 'm_bagged_logit_gb', 'm_dual_logit_gb',
 
+                         'm_meta_committee_100', 'm_deep_committee_100',
+
                          'predictions', 'predictions_ensemble', 'comparison_df']
 
         for k in required_keys:
@@ -1612,7 +2075,7 @@ class TestRunAllLotteryMethods:
 
         assert len(results['comparison_df']) == 7
 
-        assert len(results['predictions_ensemble']) == 15
+        assert len(results['predictions_ensemble']) == 17
 
         
 
@@ -1666,7 +2129,9 @@ class TestRunAllLotteryMethods:
 
                          'm_adaboost', 'm_gradboost', 'm_stoch_gb', 'm_logit_gb', 'm_cycle_gb', 'm_stacking', 'm_mom_ens', 'm_bal_ens',
 
-                         'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd', 'm_bagged_logit_gb',
+                         'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd', 'm_bagged_logit_gb', 'm_dual_logit_gb',
+
+                         'm_meta_committee_100', 'm_deep_committee_100',
 
                          'pred_consenso', 'consensus_scores', 'predictions', 'predictions_hybrid',
 
@@ -1678,13 +2143,13 @@ class TestRunAllLotteryMethods:
 
 
 
-        assert len(results['predictions']) == 38
+        assert len(results['predictions']) == 40
 
-        assert len(results['comparison_df']) == 38
+        assert len(results['comparison_df']) == 40
 
         assert len(results['predictions_hybrid']) == 15
 
-        assert len(results['predictions_ensemble']) == 15
+        assert len(results['predictions_ensemble']) == 17
 
 
 

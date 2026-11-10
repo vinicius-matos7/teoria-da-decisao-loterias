@@ -535,6 +535,46 @@ class TestEdgeCasesAndRobustness:
             assert all(len(d) == 6 for d in sub['dezenas'])
             assert all(len(set(d)) == 6 for d in sub['dezenas'])
 
+    def test_meta_committee_ensembles_in_walk_forward(self):
+        """Verifica que os Meta-Ensembles de Alto Comite (M=50 e M=100) rodam no LotteryBacktestMonitor."""
+        np.random.seed(42)
+        n_concursos = 70
+        n_dezenas = 60
+        k = 6
+
+        matrix = np.zeros((n_concursos, n_dezenas), dtype=int)
+        for i in range(n_concursos):
+            draw = np.random.choice(n_dezenas, size=k, replace=False)
+            matrix[i, draw] = 1
+
+        df = pd.DataFrame({'Concurso': np.arange(1, n_concursos + 1)})
+        for col_idx in range(k):
+            df[f'bola {col_idx + 1}'] = 0
+        for i in range(n_concursos):
+            drawn = np.where(matrix[i] == 1)[0] + 1
+            for col_idx, num in enumerate(drawn):
+                df.at[i, f'bola {col_idx + 1}'] = num
+
+        monitor = LotteryBacktestMonitor(game='megasena')
+        monitor.df = df
+        monitor.binary_matrix = matrix
+        monitor.n_concursos = n_concursos
+
+        committee_models = [
+            'Ensemble Meta-Comitê Pré-Treinado (M=50)',
+            'Ensemble Meta-Comitê Pré-Treinado (M=100)',
+            'Ensemble Comitê Profundo Multi-Família (M=50)',
+            'Ensemble Comitê Profundo Multi-Família (M=100)',
+        ]
+        monitor.run_walk_forward(n_contests=1, models_to_run=committee_models, verbose=False)
+
+        assert len(monitor.raw_results_df) == len(committee_models)
+        for m_name in committee_models:
+            sub = monitor.raw_results_df[monitor.raw_results_df['model'] == m_name]
+            assert len(sub) == 1
+            assert len(sub.iloc[0]['dezenas']) == 6
+            assert len(set(sub.iloc[0]['dezenas'])) == 6
+
     def test_insufficient_history_raises_error(self):
         """Verifica que ultrapassar o histórico com concursos insuficientes de warmup aciona ValueError com mensagem clara."""
         monitor = LotteryBacktestMonitor(game='megasena')
