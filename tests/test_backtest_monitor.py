@@ -565,6 +565,7 @@ class TestEdgeCasesAndRobustness:
             'Ensemble Meta-Comitê Pré-Treinado (M=100)',
             'Ensemble Comitê Profundo Multi-Família (M=50)',
             'Ensemble Comitê Profundo Multi-Família (M=100)',
+            'Ensemble Comitê de Gianella (M=100)',
         ]
         monitor.run_walk_forward(n_contests=1, models_to_run=committee_models, verbose=False)
 

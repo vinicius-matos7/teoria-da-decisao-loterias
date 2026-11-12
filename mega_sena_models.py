@@ -6102,6 +6102,7 @@ def _extract_trained_ensemble_signals(trained_ensembles: Dict[str, Any],
         'escore_stochastic_gd',
         'escore_meta_comite',
         'escore_comite_profundo',
+        'escore_gianella_comite',
     ]
 
     def _df_to_score_vec(df_scores: pd.DataFrame) -> Optional[np.ndarray]:
@@ -6900,7 +6901,583 @@ class LotteryDeepEnsembleCommitteeModel:
         return self.scores_df_.copy()
 
 
-LotteryHighCommitteeBootstrappedMetaModel = LotteryDeepEnsembleCommitteeModel
+LotteryHighCommitteeBootstrappedMetaModel = LotteryDeepEnsembleCommitteeModel
+
+
+def _resolve_gianella_group_size(n_dezenas: int, requested_size: int) -> int:
+    """Retorna um tamanho de grupo divisor de n_dezenas <= requested_size."""
+    if requested_size > 0 and n_dezenas % requested_size == 0:
+        return int(requested_size)
+    upper = min(max(1, int(requested_size)), int(n_dezenas))
+    for cand in range(upper, 0, -1):
+        if n_dezenas % cand == 0:
+            return cand
+    return 1
+
+
+class LotteryGianellaCommitteeModel:
+    """
+    Meta-Ensemble Comitê de Gianella (Método 37, padrão M=100).
+    Combina a Geometria do Acaso multi-gabarito (Gianella, 2013) com:
+      1. Multi-Paradigm Signal Bank + Encolhimento Bayesiano / James-Stein (Shrinkage):
+         Unifica os 15 ensembles pré-treinados com sinais fundamentais (Bayes Global,
+         Bayes Adaptativo, Frequência/Atraso Balanceado e Momentum, Regressão Logística),
+         aplicando encolhimento em direção à priori uniforme neutra para cortar ruído amostral.
+      2. Distribuição Multi-Template (Top-K Gabaritos Diofantinos + Transição Markoviana):
+         Em vez de fixar apenas o 1º gabarito combinatório, amostra proporcionalmente entre
+         os Top-3 gabaritos mais prováveis com suavização bayesiana e viés de transição.
+      3. Filtros Combinatórios Ortogonais (TCL Soma + Paridade):
+         Projeta os bilhetes dentro das cotas exatas de cores de Gianella satisfazendo a
+         faixa central da Soma pelo Teorema Central do Limite e o equilíbrio Par/Ímpar.
+      4. Comitê Monte Carlo (padrão M=100, Random Subspaces + Dirichlet + Calibração Térmica):
+         Reduz a variância do estimador e quantifica a incerteza padrão (SE).
+    """
+
+    def __init__(self,
+                 n_committees: int = 100,
+                 top_templates: int = 3,
+                 shrinkage_alpha: float = 0.25,
+                 subspace_ratio: float = 0.65,
+                 include_sub_estimators: bool = True,
+                 dirichlet_alpha: float = 1.5,
+                 temperature_range: Tuple[float, float] = (0.75, 1.50),
+                 use_structural_filter: bool = True,
+                 tcl_z_bound: float = 1.35,
+                 voting: str = 'hybrid',
+                 random_state: int = 42):
+        if n_committees <= 0:
+            raise ValueError(f"n_committees deve ser estritamente positivo (> 0). Recebido: {n_committees}")
+        if top_templates <= 0:
+            raise ValueError(f"top_templates deve ser > 0. Recebido: {top_templates}")
+        if not (0.0 <= shrinkage_alpha <= 1.0):
+            raise ValueError(f"shrinkage_alpha deve estar em [0.0, 1.0]. Recebido: {shrinkage_alpha}")
+        if not (0.0 < subspace_ratio <= 1.0):
+            raise ValueError(f"subspace_ratio deve estar em (0.0, 1.0]. Recebido: {subspace_ratio}")
+        if dirichlet_alpha <= 0.0:
+            raise ValueError(f"dirichlet_alpha deve ser > 0. Recebido: {dirichlet_alpha}")
+        if tcl_z_bound <= 0.0:
+            raise ValueError(f"tcl_z_bound deve ser > 0. Recebido: {tcl_z_bound}")
+        if voting not in ('hybrid', 'structural', 'soft', 'hard', 'borda'):
+            raise ValueError(
+                f"voting deve ser 'hybrid', 'structural', 'soft', 'hard' ou 'borda'. Recebido: {voting}"
+            )
+        if len(temperature_range) != 2 or temperature_range[0] <= 0.0 or temperature_range[0] > temperature_range[1]:
+            raise ValueError(f"temperature_range inválido: {temperature_range}")
+
+        self.n_committees = int(n_committees)
+        self.top_templates = int(top_templates)
+        self.shrinkage_alpha = float(shrinkage_alpha)
+        self.subspace_ratio = float(subspace_ratio)
+        self.include_sub_estimators = bool(include_sub_estimators)
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.temperature_range = temperature_range
+        self.use_structural_filter = bool(use_structural_filter)
+        self.tcl_z_bound = float(tcl_z_bound)
+        self.voting = voting
+        self.random_state = int(random_state)
+
+        self.trained_ensembles_: Dict[str, Any] = {}
+        self.signal_names_: List[str] = []
+        self.sub_estimator_count_: int = 0
+        self.ensemble_contributions_: Dict[str, float] = {}
+        self.group_size_: int = 10
+        self.n_colors_: int = 6
+        self.k_fit_: int = 6
+        self.template_distribution_: List[Tuple[Tuple[int, ...], float]] = []
+        self.template_usage_: Dict[str, int] = {}
+        self.best_template_: Optional[Tuple[int, ...]] = None
+        self.color_scores_comite_: Optional[np.ndarray] = None
+        self.sum_bounds_: Tuple[float, float] = (0.0, 0.0)
+        self.even_bounds_: Tuple[int, int] = (0, 0)
+        self.sum_sigma_: float = 1.0
+        self.committee_members_: List[Dict[str, Any]] = []
+        self.convergence_curve_: List[Dict[str, float]] = []
+        self.committee_std_: Optional[np.ndarray] = None
+        self.mean_se_: float = 0.0
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+        self.top_ticket_metrics_: Dict[str, Any] = {}
+
+    def _compute_structural_bounds(self, n_dezenas: int, k: int) -> Tuple[Tuple[float, float], Tuple[int, int], float]:
+        k_eff = min(max(1, int(k)), int(n_dezenas))
+        mu_sum = float(k_eff) * float(n_dezenas + 1) / 2.0
+        var_sum = float(k_eff) * float((n_dezenas + 1) * max(0, n_dezenas - k_eff)) / 12.0
+        sigma_sum = float(np.sqrt(max(var_sum, 1.0)))
+        sum_low = mu_sum - self.tcl_z_bound * sigma_sum
+        sum_high = mu_sum + self.tcl_z_bound * sigma_sum
+
+        n_evens_universe = n_dezenas // 2
+        exp_even = float(k_eff) * (float(n_evens_universe) / float(max(1, n_dezenas)))
+        tol_even = max(1, int(round(0.22 * k_eff)))
+        even_low = max(0, int(np.floor(exp_even)) - tol_even)
+        even_high = min(k_eff, int(np.ceil(exp_even)) + tol_even)
+        return (sum_low, sum_high), (even_low, even_high), sigma_sum
+
+    def _build_multitemplate_distribution(self,
+                                          binary_matrix: np.ndarray,
+                                          g_model: GianellaColorTemplateModel) -> Tuple[List[Tuple[int, ...]], np.ndarray]:
+        df_t = g_model.template_df_
+        top_df = df_t.head(min(self.top_templates, len(df_t))).copy()
+        templates = [tuple(int(x) for x in pt) for pt in top_df['part_tuple'].tolist()]
+        theo_probs = np.asarray(top_df['prob_teorica'].values, dtype=float)
+        theo_probs = theo_probs / max(float(theo_probs.sum()), 1e-12)
+
+        n_draws = binary_matrix.shape[0]
+        emp_counts = np.asarray(top_df['ocorrencias'].values, dtype=float)
+        emp_smoothed = (emp_counts + 1.0) / float(max(1, n_draws) + len(templates))
+        emp_smoothed = emp_smoothed / max(float(emp_smoothed.sum()), 1e-12)
+
+        base_probs = 0.70 * theo_probs + 0.30 * emp_smoothed
+
+        if n_draws >= 2 and len(templates) > 1:
+            seq_templates: List[str] = []
+            for d in range(n_draws):
+                counts = sorted(
+                    [int(binary_matrix[d, c * self.group_size_:(c + 1) * self.group_size_].sum())
+                     for c in range(self.n_colors_)],
+                    reverse=True,
+                )
+                seq_templates.append('-'.join(str(x) for x in counts))
+            last_tpl = seq_templates[-1]
+            tpl_strs = ['-'.join(str(x) for x in t) for t in templates]
+            trans_counts = np.zeros(len(templates), dtype=float)
+            for idx_d in range(n_draws - 1):
+                if seq_templates[idx_d] == last_tpl and seq_templates[idx_d + 1] in tpl_strs:
+                    trans_counts[tpl_strs.index(seq_templates[idx_d + 1])] += 1.0
+            prior_w = 20.0
+            markov_probs = (trans_counts + prior_w * base_probs) / float(trans_counts.sum() + prior_w)
+            combined = 0.85 * base_probs + 0.15 * markov_probs
+        else:
+            combined = base_probs
+
+        combined = combined / max(float(combined.sum()), 1e-12)
+        return templates, combined
+
+    def _collect_shrinkage_signals(self,
+                                   binary_matrix: np.ndarray,
+                                   cfg: Dict,
+                                   trained_ensembles: Optional[Dict[str, Any]],
+                                   base_signals: Optional[Dict[str, Any]],
+                                   n_dezenas: int,
+                                   k: int) -> Tuple[List[str], np.ndarray, np.ndarray, List[str], np.ndarray, np.ndarray]:
+        n_concursos = binary_matrix.shape[0]
+        if trained_ensembles is not None:
+            if not isinstance(trained_ensembles, dict) or len(trained_ensembles) == 0:
+                raise ValueError("trained_ensembles deve ser um dicionário não-vazio.")
+            self.trained_ensembles_ = dict(trained_ensembles)
+        else:
+            helper = LotteryPretrainedMetaCommitteeModel(n_committees=10, random_state=self.random_state)
+            self.trained_ensembles_ = helper._fit_default_base_ensembles(binary_matrix, cfg)
+
+        ens_names, ens_mat, ens_oob, sub_names, sub_mat = _extract_trained_ensemble_signals(
+            self.trained_ensembles_, n_dezenas, include_sub_estimators=self.include_sub_estimators
+        )
+
+        bs = base_signals or {}
+        m1 = bs.get('m1')
+        if m1 is None or getattr(m1, 'scores_df_', None) is None:
+            m1 = FrequencyDelayModel(half_life=100.0, alpha=0.5).fit(binary_matrix)
+        m3_static = bs.get('m3_static')
+        if m3_static is None or getattr(m3_static, 'posterior_df_', None) is None:
+            m3_static = BayesianDecisionModel(
+                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 9.0)
+            ).fit(binary_matrix)
+        m3_dyn = bs.get('m3_dyn')
+        if m3_dyn is None or getattr(m3_dyn, 'posterior_df_', None) is None:
+            m3_dyn = BayesianDecisionModel(
+                alpha_0=cfg.get('alpha_0', 1.0), beta_0=cfg.get('beta_0', 9.0), decay_half_life=150.0
+            ).fit(binary_matrix)
+        m2 = bs.get('m2')
+        if m2 is None and n_concursos >= 25:
+            try:
+                m2 = MultiLabelMLModel(estimator='logistic_regression', random_state=self.random_state).fit(binary_matrix)
+            except Exception:
+                m2 = None
+
+        fund_names: List[str] = []
+        fund_vecs: List[np.ndarray] = []
+
+        # Bayes Global (também usado como ancora bayesiana de shrinkage)
+        bg_vec = np.zeros(n_dezenas, dtype=float)
+        for _, r in m3_static.posterior_df_.iterrows():
+            d_i = int(r['dezena']) - 1
+            if 0 <= d_i < n_dezenas:
+                bg_vec[d_i] = float(r['esperanca_posteriori'])
+        bayes_anchor = _min_max_scale(bg_vec)
+        fund_names.append('bayes_global')
+        fund_vecs.append(bayes_anchor)
+
+        bd_vec = np.zeros(n_dezenas, dtype=float)
+        for _, r in m3_dyn.posterior_df_.iterrows():
+            d_i = int(r['dezena']) - 1
+            if 0 <= d_i < n_dezenas:
+                bd_vec[d_i] = float(r['esperanca_posteriori'])
+        fund_names.append('bayes_adaptive')
+        fund_vecs.append(_min_max_scale(bd_vec))
+
+        bal_vec = np.zeros(n_dezenas, dtype=float)
+        mom_vec = np.zeros(n_dezenas, dtype=float)
+        for _, r in m1.scores_df_.iterrows():
+            d_i = int(r['dezena']) - 1
+            if 0 <= d_i < n_dezenas:
+                bal_vec[d_i] = float(r['escore_composto'])
+                mom_vec[d_i] = float(r['freq_ponderada'])
+        fund_names.extend(['freq_balanced', 'freq_momentum'])
+        fund_vecs.extend([_min_max_scale(bal_vec), _min_max_scale(mom_vec)])
+
+        if m2 is not None:
+            try:
+                df_ml = m2.get_probabilities_df()
+                ml_vec = np.zeros(n_dezenas, dtype=float)
+                for _, r in df_ml.iterrows():
+                    d_i = int(r['dezena']) - 1
+                    if 0 <= d_i < n_dezenas:
+                        ml_vec[d_i] = float(r['probabilidade_calibrada_sorteio'])
+                fund_names.append('ml_logistic')
+                fund_vecs.append(_min_max_scale(ml_vec))
+            except Exception:
+                pass
+
+        all_names = ens_names + fund_names
+        if len(ens_names) > 0:
+            main_mat = np.vstack([ens_mat, np.vstack(fund_vecs)])
+            mean_oob = float(np.mean(ens_oob)) if len(ens_oob) > 0 else 0.5
+            fund_oobs = np.full(len(fund_names), max(0.35, mean_oob), dtype=float)
+            oob_vec = np.concatenate([ens_oob, fund_oobs])
+        else:
+            main_mat = np.vstack(fund_vecs)
+            oob_vec = np.full(len(fund_names), 0.5, dtype=float)
+
+        # Prior neutra combinada (uniforme 0.5 + ancora bayesiana conjugada)
+        prior_anchor = 0.60 * np.full(n_dezenas, 0.5, dtype=float) + 0.40 * bayes_anchor
+        main_shrunk = (1.0 - self.shrinkage_alpha) * main_mat + self.shrinkage_alpha * prior_anchor[None, :]
+        if len(sub_mat) > 0:
+            sub_shrunk = (1.0 - self.shrinkage_alpha) * sub_mat + self.shrinkage_alpha * prior_anchor[None, :]
+        else:
+            sub_shrunk = sub_mat
+
+        return all_names, main_shrunk, oob_vec, sub_names, sub_shrunk, prior_anchor
+
+    def _structural_violation(self, ticket: List[int]) -> float:
+        s_val = float(sum(ticket))
+        e_val = sum(1 for x in ticket if x % 2 == 0)
+        s_low, s_high = self.sum_bounds_
+        e_low, e_high = self.even_bounds_
+        v_sum = max(0.0, s_low - s_val, s_val - s_high) / max(self.sum_sigma_, 1.0)
+        v_even = float(max(0, e_low - e_val, e_val - e_high))
+        return v_sum + 1.5 * v_even
+
+    def _project_gianella_ticket(self,
+                                 scores_vec: np.ndarray,
+                                 color_order: np.ndarray,
+                                 template: Tuple[int, ...],
+                                 n_dezenas: int,
+                                 k_eval: int,
+                                 apply_filter: bool = True) -> List[int]:
+        if k_eval <= 0:
+            return []
+        if k_eval > n_dezenas:
+            k_eval = n_dezenas
+
+        # Caso k_eval difira do k calibrado ou cotas do template nao somem k_eval,
+        # usa selecao direta pelo ranking de escores para manter consistencia de tamanho.
+        if sum(template) != k_eval:
+            top_idx = np.argsort(scores_vec, kind='mergesort')[::-1][:k_eval]
+            return sorted((top_idx + 1).tolist())
+
+        selected_by_color: Dict[int, List[int]] = {}
+        unused_by_color: Dict[int, List[int]] = {}
+        ticket: List[int] = []
+
+        for idx, c_idx in enumerate(color_order):
+            c_int = int(c_idx)
+            quota = int(template[idx]) if idx < len(template) else 0
+            start_d = c_int * self.group_size_ + 1
+            end_d = min(n_dezenas, (c_int + 1) * self.group_size_) + 1
+            c_balls = list(range(start_d, end_d))
+            c_balls.sort(key=lambda d: (-float(scores_vec[d - 1]), d))
+            picked = c_balls[:quota]
+            rest = c_balls[quota:]
+            selected_by_color[c_int] = picked
+            unused_by_color[c_int] = rest
+            ticket.extend(picked)
+
+        if apply_filter and self.use_structural_filter and k_eval == self.k_fit_:
+            cur_viol = self._structural_violation(ticket)
+            max_swaps = min(k_eval, 8)
+            for _ in range(max_swaps):
+                if cur_viol <= 1e-9:
+                    break
+                best_swap = None
+                best_key = (cur_viol, float('inf'))
+                for c_int, picked in selected_by_color.items():
+                    rest = unused_by_color[c_int]
+                    if not picked or not rest:
+                        continue
+                    for out_b in picked:
+                        for in_b in rest:
+                            cand_ticket = [in_b if x == out_b else x for x in ticket]
+                            v_new = self._structural_violation(cand_ticket)
+                            if v_new < cur_viol - 1e-9:
+                                score_loss = float(scores_vec[out_b - 1] - scores_vec[in_b - 1])
+                                cand_key = (round(v_new, 6), score_loss)
+                                if cand_key < best_key:
+                                    best_key = cand_key
+                                    best_swap = (c_int, out_b, in_b, v_new, cand_ticket)
+                if best_swap is None:
+                    break
+                c_int, out_b, in_b, cur_viol, ticket = best_swap
+                selected_by_color[c_int].remove(out_b)
+                selected_by_color[c_int].append(in_b)
+                unused_by_color[c_int].remove(in_b)
+                unused_by_color[c_int].append(out_b)
+
+        return sorted([int(x) for x in ticket[:k_eval]])
+
+    def fit(self,
+            binary_matrix: np.ndarray,
+            cfg: Optional[Dict] = None,
+            trained_ensembles: Optional[Dict[str, Any]] = None,
+            base_signals: Optional[Dict[str, Any]] = None) -> 'LotteryGianellaCommitteeModel':
+        """Ajusta o Comitê de Gianella M=100 com distribuição multi-template, shrinkage e filtros TCL/Paridade."""
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2 or binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix deve ser uma matriz numpy 2D com pelo menos 1 concurso.")
+
+        cfg = cfg or {}
+        _, n_dezenas = binary_matrix.shape
+        k = int(cfg.get('k', 6))
+        req_group = int(cfg.get('gianella_group_size', 10 if n_dezenas >= 40 else 5))
+
+        self.k_fit_ = k
+        self.group_size_ = _resolve_gianella_group_size(n_dezenas, req_group)
+        self.n_colors_ = n_dezenas // self.group_size_
+        self.sum_bounds_, self.even_bounds_, self.sum_sigma_ = self._compute_structural_bounds(n_dezenas, k)
+
+        # 1. Gabarito Multi-Template Gianella
+        bs = base_signals or {}
+        g_model = bs.get('gianella_model')
+        if (g_model is None or getattr(g_model, 'template_df_', None) is None
+                or getattr(g_model, 'n_dezenas', None) != n_dezenas
+                or getattr(g_model, 'k', None) != k
+                or getattr(g_model, 'group_size', None) != self.group_size_):
+            g_model = GianellaColorTemplateModel(
+                n_dezenas=n_dezenas, k=k, group_size=self.group_size_, random_state=self.random_state
+            ).fit(binary_matrix)
+
+        templates, tpl_probs = self._build_multitemplate_distribution(binary_matrix, g_model)
+        self.template_distribution_ = [(templates[i], float(tpl_probs[i])) for i in range(len(templates))]
+        self.best_template_ = templates[0]
+
+        # 2. Banco de Sinais Multi-Paradigma + Shrinkage Bayesiano
+        all_names, main_mat, oob_vec, sub_names, sub_mat, prior_anchor = self._collect_shrinkage_signals(
+            binary_matrix, cfg, trained_ensembles, bs, n_dezenas, k
+        )
+        self.signal_names_ = all_names
+        self.sub_estimator_count_ = len(sub_names)
+
+        k_main = len(all_names)
+        k_sub = len(sub_names)
+        q_main = max(1, min(k_main, int(np.ceil(self.subspace_ratio * k_main))))
+        if k_main >= 3:
+            q_main = max(2, q_main)
+        q_sub = max(1, min(k_sub, int(np.ceil(self.subspace_ratio * k_sub)))) if k_sub > 0 else 0
+
+        alpha_prior = self.dirichlet_alpha * (1.0 + 0.35 * oob_vec)
+        rng = np.random.RandomState(self.random_state)
+        t_min, t_max = self.temperature_range
+
+        all_soft = np.zeros((self.n_committees, n_dezenas), dtype=float)
+        all_probs = np.zeros((self.n_committees, n_dezenas), dtype=float)
+        all_borda = np.zeros((self.n_committees, n_dezenas), dtype=float)
+        hard_votes = np.zeros(n_dezenas, dtype=float)
+        color_scores_accum = np.zeros(self.n_colors_, dtype=float)
+        accum_weights = np.zeros(k_main, dtype=float)
+        self.template_usage_ = {'-'.join(str(x) for x in t): 0 for t in templates}
+        self.committee_members_ = []
+        self.convergence_curve_ = []
+
+        running_soft = np.zeros(n_dezenas, dtype=float)
+        prev_top_set: Optional[set] = None
+        k_ballot = min(max(1, k), n_dezenas)
+
+        for m in range(self.n_committees):
+            idx_main = rng.choice(k_main, size=q_main, replace=False)
+            w_main = rng.dirichlet(alpha_prior[idx_main])
+            accum_weights[idx_main] += w_main
+            s_main = w_main @ main_mat[idx_main]
+
+            if q_sub > 0:
+                idx_sub = rng.choice(k_sub, size=q_sub, replace=False)
+                w_sub = rng.dirichlet(np.full(q_sub, self.dirichlet_alpha))
+                s_sub = w_sub @ sub_mat[idx_sub]
+                beta_sub = float(rng.uniform(0.15, 0.35))
+                s_raw = (1.0 - beta_sub) * _min_max_scale(s_main) + beta_sub * _min_max_scale(s_sub)
+            else:
+                s_raw = _min_max_scale(s_main)
+
+            s_shrunk = (1.0 - 0.15 * self.shrinkage_alpha) * _min_max_scale(s_raw) + (0.15 * self.shrinkage_alpha) * prior_anchor
+            s_norm = _min_max_scale(s_shrunk)
+
+            temp_m = float(rng.uniform(t_min, t_max))
+            std_s = float(np.std(s_norm))
+            z_s = (s_norm - float(np.mean(s_norm))) / (std_s if std_s > 1e-12 else 1.0)
+            logits = np.clip(z_s / temp_m, -20.0, 20.0)
+            exp_l = np.exp(logits - np.max(logits))
+            p_m = exp_l / np.sum(exp_l)
+
+            order = np.argsort(s_norm, kind='mergesort')[::-1]
+            borda_m = np.zeros(n_dezenas, dtype=float)
+            denom = float(max(1, n_dezenas - 1))
+            for r_idx, d_idx in enumerate(order):
+                borda_m[d_idx] = 1.0 - (r_idx / denom)
+
+            # Sortear gabarito da distribuicao multi-template Gianella e projetar bilhete estrutural
+            tpl_idx = int(rng.choice(len(templates), p=tpl_probs))
+            tpl_m = templates[tpl_idx]
+            tpl_str = '-'.join(str(x) for x in tpl_m)
+            self.template_usage_[tpl_str] += 1
+
+            c_means = np.asarray([
+                float(np.mean(s_norm[c * self.group_size_:(c + 1) * self.group_size_]))
+                for c in range(self.n_colors_)
+            ], dtype=float)
+            color_scores_accum += c_means
+            c_jitter = c_means + rng.normal(0.0, 0.015, size=self.n_colors_)
+            c_order_m = np.argsort(c_jitter, kind='mergesort')[::-1]
+
+            ticket_m = self._project_gianella_ticket(
+                s_norm, c_order_m, tpl_m, n_dezenas, k_ballot, apply_filter=self.use_structural_filter
+            )
+            for dez in ticket_m:
+                hard_votes[dez - 1] += 1.0
+
+            all_soft[m] = s_norm
+            all_probs[m] = p_m
+            all_borda[m] = borda_m
+
+            self.committee_members_.append({
+                'member_idx': m,
+                'template': tpl_str,
+                'temperature': round(temp_m, 4),
+                'top_k': ticket_m,
+            })
+
+            running_soft += s_norm
+            cur_mean = running_soft / float(m + 1)
+            cur_top_set = set((np.argsort(cur_mean, kind='mergesort')[::-1][:k_ballot] + 1).tolist())
+            if prev_top_set is not None:
+                union_sz = len(cur_top_set | prev_top_set)
+                jaccard = len(cur_top_set & prev_top_set) / float(union_sz) if union_sz > 0 else 1.0
+            else:
+                jaccard = 1.0
+            prev_top_set = cur_top_set
+            self.convergence_curve_.append({
+                'committee_size': m + 1,
+                'top_k_jaccard': round(float(jaccard), 4),
+                'score_se': round(float(np.mean(np.std(all_soft[:m + 1], axis=0) / np.sqrt(m + 1))), 6),
+            })
+
+        soft_mean = np.mean(all_soft, axis=0)
+        prob_mean = np.mean(all_probs, axis=0)
+        borda_mean = np.mean(all_borda, axis=0)
+        vote_rate = hard_votes / float(self.n_committees)
+
+        self.color_scores_comite_ = color_scores_accum / float(self.n_committees)
+        self.committee_std_ = np.std(all_soft, axis=0)
+        se_vec = self.committee_std_ / np.sqrt(float(self.n_committees))
+        self.mean_se_ = float(np.mean(se_vec))
+        self.ensemble_contributions_ = {
+            all_names[i]: float(np.round(accum_weights[i] / float(self.n_committees), 5))
+            for i in range(k_main)
+        }
+
+        hybrid_raw = (
+            0.35 * _min_max_scale(soft_mean)
+            + 0.25 * _min_max_scale(prob_mean)
+            + 0.15 * _min_max_scale(borda_mean)
+            + 0.25 * vote_rate
+        )
+        hybrid_norm = _min_max_scale(hybrid_raw)
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        color_groups = (dezenas - 1) // self.group_size_
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'grupo_cor': color_groups,
+            'escore_gianella_comite': np.round(hybrid_norm, 5),
+            'probabilidade_comite': np.round(prob_mean, 5),
+            'escore_soft': np.round(soft_mean, 5),
+            'escore_borda': np.round(borda_mean, 5),
+            'votos_gianella': hard_votes.astype(int),
+            'taxa_consenso_pct': np.round(vote_rate * 100.0, 2),
+            'incerteza_se': np.round(se_vec, 6),
+        }).sort_values(['escore_gianella_comite', 'votos_gianella', 'dezena'], ascending=[False, False, True]).reset_index(drop=True)
+
+        self.top_k_ = self.predict_top_k(k_ballot, voting=self.voting) if k > 0 else []
+        s_top = sum(self.top_k_)
+        e_top = sum(1 for x in self.top_k_ if x % 2 == 0)
+        self.top_ticket_metrics_ = {
+            'top_k': self.top_k_,
+            'best_template': '-'.join(str(x) for x in self.best_template_),
+            'sum': s_top,
+            'sum_bounds': tuple(round(v, 2) for v in self.sum_bounds_),
+            'evens': e_top,
+            'even_bounds': self.even_bounds_,
+            'passes_tcl_sum': bool(self.sum_bounds_[0] <= s_top <= self.sum_bounds_[1]),
+            'passes_parity': bool(self.even_bounds_[0] <= e_top <= self.even_bounds_[1]),
+            'mean_se': round(self.mean_se_, 6),
+        }
+        return self
+
+    def predict_top_k(self, k: Optional[int] = None, voting: Optional[str] = None) -> List[int]:
+        """Retorna as top K dezenas segundo o critério estrutural Gianella + TCL/Paridade ou votação."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() antes de gerar predições.")
+        if k is None:
+            k = self.k_fit_
+        if k <= 0:
+            return []
+        n_dezenas = len(self.scores_df_)
+        k = min(int(k), n_dezenas)
+
+        use_voting = voting or self.voting
+        if use_voting in ('hybrid', 'structural'):
+            score_col = 'escore_gianella_comite' if use_voting == 'hybrid' else 'taxa_consenso_pct'
+            ordered_scores = np.zeros(n_dezenas, dtype=float)
+            for _, row in self.scores_df_.iterrows():
+                ordered_scores[int(row['dezena']) - 1] = float(row[score_col])
+            c_order = np.argsort(self.color_scores_comite_, kind='mergesort')[::-1]
+            apply_f = self.use_structural_filter or (use_voting == 'structural')
+            return self._project_gianella_ticket(
+                ordered_scores, c_order, self.best_template_, n_dezenas, k, apply_filter=apply_f
+            )
+        elif use_voting == 'hard':
+            df_sorted = self.scores_df_.sort_values(
+                ['votos_gianella', 'escore_gianella_comite', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'soft':
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_soft', 'probabilidade_comite', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'borda':
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_borda', 'escore_gianella_comite', 'dezena'], ascending=[False, False, True]
+            )
+        else:
+            raise ValueError(
+                f"voting deve ser 'hybrid', 'structural', 'soft', 'hard' ou 'borda'. Recebido: {use_voting}"
+            )
+        return sorted([int(x) for x in df_sorted.head(k)['dezena'].tolist()])
+
+    def get_scores_df(self) -> pd.DataFrame:
+        """Retorna o DataFrame detalhado com os escores do Comitê de Gianella."""
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+LotteryGianellaMetaCommitteeModel = LotteryGianellaCommitteeModel
+
 
 
 
@@ -9541,6 +10118,35 @@ def predict_deep_ensemble_committee(binary_matrix: np.ndarray,
     return model.predict_top_k(k_actual)
 
 
+
+
+def predict_gianella_committee(binary_matrix: np.ndarray,
+                               cfg: Dict,
+                               k: Optional[int] = None,
+                               n_committees: int = 100,
+                               top_templates: int = 3,
+                               shrinkage_alpha: float = 0.25,
+                               subspace_ratio: float = 0.65,
+                               use_structural_filter: bool = True,
+                               voting: str = 'hybrid',
+                               trained_ensembles: Optional[Dict[str, Any]] = None,
+                               base_signals: Optional[Dict[str, Any]] = None,
+                               random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Comitê de Gianella (Método 37, padrão M=100)."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryGianellaCommitteeModel(
+        n_committees=n_committees,
+        top_templates=top_templates,
+        shrinkage_alpha=shrinkage_alpha,
+        subspace_ratio=subspace_ratio,
+        use_structural_filter=use_structural_filter,
+        voting=voting,
+        random_state=random_state,
+    )
+    model.fit(binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles, base_signals=base_signals)
+    return model.predict_top_k(k_actual)
+
+
 def compare_committee_sizes(binary_matrix: np.ndarray,
                             cfg: Dict,
                             sizes: Tuple[int, ...] = (10, 50, 100),
@@ -10043,6 +10649,19 @@ def run_all_lottery_methods(filepath: str,
     m_deep_committee_100.fit(binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles_dict)
     pred_deep_committee_100 = m_deep_committee_100.predict_top_k(k)
 
+    base_signals_gianella = {
+        'm1': m1,
+        'm2': m2,
+        'm3_static': m3_static,
+        'm3_dyn': m3_dyn,
+        'gianella_model': m4,
+    }
+    m_gianella_committee_100 = LotteryGianellaCommitteeModel(n_committees=100, random_state=42)
+    m_gianella_committee_100.fit(
+        binary_matrix, cfg=cfg, trained_ensembles=trained_ensembles_dict, base_signals=base_signals_gianella
+    )
+    pred_gianella_committee_100 = m_gianella_committee_100.predict_top_k(k)
+
 
 
     predictions_ensemble = {
@@ -10079,7 +10698,8 @@ def run_all_lottery_methods(filepath: str,
 
         'Ensemble Meta-Comitê Pré-Treinado (M=100)': pred_meta_committee_100,
 
-        'Ensemble Comitê Profundo Multi-Família (M=100)': pred_deep_committee_100
+        'Ensemble Comitê Profundo Multi-Família (M=100)': pred_deep_committee_100,
+        'Ensemble Comitê de Gianella (M=100)': pred_gianella_committee_100
 
     }
 
@@ -10175,6 +10795,7 @@ def run_all_lottery_methods(filepath: str,
         predictions['Metodo 35 (Ensemble Meta-Comitê Pré-Treinado - M=100)'] = pred_meta_committee_100
 
         predictions['Metodo 36 (Ensemble Comitê Profundo Multi-Família - M=100)'] = pred_deep_committee_100
+        predictions['Metodo 37 (Ensemble Comite de Gianella - M=100)'] = pred_gianella_committee_100
 
 
 
@@ -10251,6 +10872,7 @@ def run_all_lottery_methods(filepath: str,
         'm_meta_committee_100': m_meta_committee_100,
 
         'm_deep_committee_100': m_deep_committee_100,
+        'm_gianella_committee_100': m_gianella_committee_100,
 
         'pred_consenso': pred_consenso,
 

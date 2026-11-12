@@ -79,6 +79,8 @@ from mega_sena_models import (
     LotteryDeepEnsembleCommitteeModel,
 
     LotteryHighCommitteeBootstrappedMetaModel,
+    LotteryGianellaCommitteeModel,
+    LotteryGianellaMetaCommitteeModel,
 
     predict_bagged_logit_gb_ensemble,
 
@@ -87,6 +89,7 @@ from mega_sena_models import (
     predict_pretrained_meta_committee,
 
     predict_deep_ensemble_committee,
+    predict_gianella_committee,
 
     compare_committee_sizes,
 
@@ -1835,6 +1838,127 @@ class TestModelsExecution:
 
 
 
+    def test_lottery_gianella_committee_model(self, synthetic_data):
+        cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
+        pre_dict = {
+            'Bagging': LotteryBaggingModel(n_estimators=4, random_state=42).fit(synthetic_data, cfg),
+            'Logit GB': LotteryLogitGradientBoostingModel(n_estimators=4, learning_rate=0.25, random_state=42).fit(synthetic_data, cfg),
+            'Momentum Ensemble': LotteryMomentumEnsembleModel(n_estimators=4, random_state=42).fit(synthetic_data, cfg),
+            'Balanced Ensemble': LotteryBalancedEnsembleModel(n_estimators=4, random_state=42).fit(synthetic_data, cfg),
+        }
+
+        assert LotteryGianellaMetaCommitteeModel is LotteryGianellaCommitteeModel
+        m_default = LotteryGianellaCommitteeModel(random_state=42)
+        assert m_default.n_committees == 100
+
+        m_default.fit(synthetic_data, cfg=cfg, trained_ensembles=pre_dict)
+        preds = m_default.predict_top_k(6)
+        assert len(preds) == 6
+        assert len(set(preds)) == 6
+        assert all(1 <= d <= 60 for d in preds)
+        assert preds == sorted(preds)
+        assert m_default.top_k_ == preds
+        assert len(m_default.committee_members_) == 100
+        assert len(m_default.convergence_curve_) == 100
+        assert 0.0 <= m_default.mean_se_ < 0.5
+        assert len(m_default.template_distribution_) == 3
+        assert abs(sum(p for _, p in m_default.template_distribution_) - 1.0) < 1e-6
+
+        # Verifica restricoes estruturais (TCL Soma + Paridade + Gabarito de Cores Gianella)
+        metrics = m_default.top_ticket_metrics_
+        assert metrics['top_k'] == preds
+        assert metrics['passes_tcl_sum'] is True
+        assert metrics['passes_parity'] is True
+        assert metrics['sum_bounds'][0] <= sum(preds) <= metrics['sum_bounds'][1]
+        n_evens = sum(1 for d in preds if d % 2 == 0)
+        assert metrics['even_bounds'][0] <= n_evens <= metrics['even_bounds'][1]
+        tpl_counts = sorted(
+            [sum(1 for d in preds if c * 10 < d <= (c + 1) * 10) for c in range(6)],
+            reverse=True,
+        )
+        assert tuple(tpl_counts) == m_default.best_template_
+
+        df_scores = m_default.get_scores_df()
+        assert len(df_scores) == 60
+        for col in ['dezena', 'grupo_cor', 'escore_gianella_comite', 'probabilidade_comite',
+                    'escore_soft', 'escore_borda', 'votos_gianella', 'taxa_consenso_pct', 'incerteza_se']:
+            assert col in df_scores.columns
+
+        # Reproducibilidade
+        m_dup = LotteryGianellaCommitteeModel(n_committees=100, random_state=42).fit(
+            synthetic_data, cfg=cfg, trained_ensembles=pre_dict
+        )
+        assert m_dup.predict_top_k(6) == preds
+
+        # Todos os modos de votacao + consistencia de top_k_
+        for v_mode in ('hybrid', 'structural', 'soft', 'hard', 'borda'):
+            mv = LotteryGianellaCommitteeModel(n_committees=30, voting=v_mode, random_state=42).fit(
+                synthetic_data, cfg=cfg, trained_ensembles=pre_dict
+            )
+            p_mode = mv.predict_top_k(6)
+            assert len(p_mode) == 6 and len(set(p_mode)) == 6
+            assert mv.top_k_ == p_mode
+
+        # Custom k != cfg['k'] deve retornar exatamente k dezenas validas
+        assert len(m_default.predict_top_k(3)) == 3
+        assert len(m_default.predict_top_k(10)) == 10
+        assert m_default.predict_top_k(0) == []
+
+        # Shrinkage alpha afeta escores
+        m_no_shrink = LotteryGianellaCommitteeModel(n_committees=30, shrinkage_alpha=0.0, random_state=42).fit(
+            synthetic_data, cfg=cfg, trained_ensembles=pre_dict
+        )
+        m_hi_shrink = LotteryGianellaCommitteeModel(n_committees=30, shrinkage_alpha=0.95, random_state=42).fit(
+            synthetic_data, cfg=cfg, trained_ensembles=pre_dict
+        )
+        assert np.max(np.abs(m_no_shrink.get_scores_df().sort_values('dezena')['escore_soft'].values
+                             - m_hi_shrink.get_scores_df().sort_values('dezena')['escore_soft'].values)) > 1e-4
+
+        # Standalone (sem trained_ensembles) + Lotofacil & Quina
+        m_standalone = LotteryGianellaCommitteeModel(n_committees=25, random_state=42).fit(synthetic_data, cfg=cfg)
+        assert len(m_standalone.predict_top_k(6)) == 6
+
+        rng_g = np.random.RandomState(11)
+        mat_lf = np.zeros((35, 25), dtype=int)
+        for i in range(35):
+            mat_lf[i, rng_g.choice(25, size=15, replace=False)] = 1
+        cfg_lf = {'k': 15, 'n_dezenas': 25, 'alpha_0': 6.0, 'beta_0': 4.0, 'gianella_group_size': 5}
+        lf_m = LotteryGianellaCommitteeModel(n_committees=40, random_state=7).fit(mat_lf, cfg=cfg_lf)
+        lf_pred = lf_m.predict_top_k(15)
+        assert len(lf_pred) == 15 and len(set(lf_pred)) == 15
+        assert lf_m.top_ticket_metrics_['passes_tcl_sum'] is True
+
+        mat_qn = np.zeros((35, 80), dtype=int)
+        for i in range(35):
+            mat_qn[i, rng_g.choice(80, size=5, replace=False)] = 1
+        cfg_qn = {'k': 5, 'n_dezenas': 80, 'alpha_0': 1.0, 'beta_0': 15.0, 'gianella_group_size': 10}
+        qn_m = LotteryGianellaCommitteeModel(n_committees=40, random_state=7).fit(mat_qn, cfg=cfg_qn)
+        qn_pred = qn_m.predict_top_k(5)
+        assert len(qn_pred) == 5 and len(set(qn_pred)) == 5
+
+        # Casos de borda: n=1, n=5, matriz zerada, n_dezenas nao divisivel por group_size
+        assert len(LotteryGianellaCommitteeModel(n_committees=10, random_state=42).fit(synthetic_data[:1], cfg).predict_top_k(6)) == 6
+        assert len(LotteryGianellaCommitteeModel(n_committees=10, random_state=42).fit(synthetic_data[:5], cfg).predict_top_k(6)) == 6
+        assert len(LotteryGianellaCommitteeModel(n_committees=15, random_state=42).fit(np.zeros((20, 60), dtype=int), cfg).predict_top_k(6)) == 6
+
+        mat_odd = np.zeros((15, 17), dtype=int)
+        for i in range(15):
+            mat_odd[i, rng_g.choice(17, size=4, replace=False)] = 1
+        cfg_odd = {'k': 4, 'n_dezenas': 17, 'alpha_0': 1.0, 'beta_0': 3.0, 'gianella_group_size': 5}
+        assert len(LotteryGianellaCommitteeModel(n_committees=15, random_state=42).fit(mat_odd, cfg=cfg_odd).predict_top_k(4)) == 4
+
+        # Validacoes de erro
+        with pytest.raises(RuntimeError):
+            LotteryGianellaCommitteeModel().predict_top_k(6)
+        with pytest.raises(ValueError):
+            LotteryGianellaCommitteeModel().fit(np.zeros((0, 60)), cfg=cfg)
+        with pytest.raises(ValueError):
+            LotteryGianellaCommitteeModel(n_committees=0)
+        with pytest.raises(ValueError):
+            LotteryGianellaCommitteeModel(shrinkage_alpha=1.5)
+        with pytest.raises(ValueError):
+            LotteryGianellaCommitteeModel(voting='invalido')
+
     def test_compare_committee_sizes(self, synthetic_data):
 
         cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
@@ -1938,6 +2062,8 @@ class TestModelsExecution:
         p_deep_50 = predict_deep_ensemble_committee(synthetic_data, cfg, k=6, n_committees=50, trained_ensembles=pre_dict)
 
         p_deep_100 = predict_deep_ensemble_committee(synthetic_data, cfg, k=6, n_committees=100, trained_ensembles=pre_dict)
+        p_gianella_100 = predict_gianella_committee(synthetic_data, cfg, k=6, trained_ensembles=pre_dict)
+        assert p_gianella_100 == predict_gianella_committee(synthetic_data, cfg, k=6, n_committees=100, trained_ensembles=pre_dict)
 
         assert p_meta_default == p_meta_100
 
@@ -1963,7 +2089,8 @@ class TestModelsExecution:
 
                           ('pretrained_meta_50', p_meta_50), ('pretrained_meta_100', p_meta_100),
 
-                          ('deep_committee_50', p_deep_50), ('deep_committee_100', p_deep_100)]:
+                          ('deep_committee_50', p_deep_50), ('deep_committee_100', p_deep_100),
+                          ('gianella_committee_100', p_gianella_100)]:
 
             assert len(bet) == 6, f"Tamanho incorreto para {name}"
 
@@ -2057,7 +2184,7 @@ class TestRunAllLotteryMethods:
 
                          'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd', 'm_bagged_logit_gb', 'm_dual_logit_gb',
 
-                         'm_meta_committee_100', 'm_deep_committee_100',
+                         'm_meta_committee_100', 'm_deep_committee_100', 'm_gianella_committee_100',
 
                          'predictions', 'predictions_ensemble', 'comparison_df']
 
@@ -2075,7 +2202,7 @@ class TestRunAllLotteryMethods:
 
         assert len(results['comparison_df']) == 7
 
-        assert len(results['predictions_ensemble']) == 17
+        assert len(results['predictions_ensemble']) == 18
 
         
 
@@ -2131,7 +2258,7 @@ class TestRunAllLotteryMethods:
 
                          'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd', 'm_bagged_logit_gb', 'm_dual_logit_gb',
 
-                         'm_meta_committee_100', 'm_deep_committee_100',
+                         'm_meta_committee_100', 'm_deep_committee_100', 'm_gianella_committee_100',
 
                          'pred_consenso', 'consensus_scores', 'predictions', 'predictions_hybrid',
 
@@ -2143,13 +2270,13 @@ class TestRunAllLotteryMethods:
 
 
 
-        assert len(results['predictions']) == 40
+        assert len(results['predictions']) == 41
 
-        assert len(results['comparison_df']) == 40
+        assert len(results['comparison_df']) == 41
 
         assert len(results['predictions_hybrid']) == 15
 
-        assert len(results['predictions_ensemble']) == 17
+        assert len(results['predictions_ensemble']) == 18
 
 
 
