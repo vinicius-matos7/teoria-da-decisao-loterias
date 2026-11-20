@@ -7989,6 +7989,393 @@ LotteryEliteMetaCommitteeModel = LotteryEliteCommitteeModel
 
 
 
+
+
+class LotteryCausalPropensityModel:
+    """
+    Modelo Bayesiano Causal Duplamente Robusto com Bootstrap de Dirichlet (Método 39).
+    
+    Fundamentação Teórica:
+      - Stephens, D. A., Nobre, W. S., Moodie, E. E. M., & Schmidt, A. M. (2023).
+        'Causal Inference Under Mis-Specification: Adjustment Based on the Propensity Score'.
+        Bayesian Analysis, 18(2), 639-694.
+      - Nobre, W. da S. (2021).
+        'A Bayesian View on Causal Inference for Observational Data'.
+        Tese de Doutorado em Estatística, Instituto de Matemática, UFRJ.
+
+    Pilares do Método:
+      1. Especificação Incorreta Consciente e Modularização (Seção 4 & 4.2):
+         Em loterias, qualquer modelo opera sob especificação incorreta da distribuição geradora.
+         A separação em dois módulos evita o vício de retroalimentação (cutting feedback),
+         impedindo que flutuações e ruídos estocásticos do sorteio imediato contaminem os pesos estruturais basais.
+      2. Módulo 1 - Escore de Propensão Estrutural b(X):
+         Mapeia invariantes estruturais (atraso relativo normalizado pelo ciclo teórico 1/p,
+         z-score de Bernoulli acumulado, posição radial/espacial na cartela e paridade).
+      3. Módulo 2 - Regressão Duplamente Robusta (Eq. 2.7 & 2.9):
+         Combina o escore de propensão b(X) com preditores dinâmicos de curto prazo Z
+         (momentum em janelas múltiplas e transições markovianas). Se a propensão estrutural
+         OU o modelo de momentum for informativo, a predição permanece consistente.
+      4. Módulo 3 - Bootstrap Bayesiano via Processo de Dirichlet (Seções 4 & 5):
+         Reamostra distribuições empíricas ponderadas por w ~ Dirichlet(1, ..., 1).
+         Minimiza a perda preditiva (Bayesian Loss Minimization) em cada réplica, integrando
+         a incerteza preditiva posterior e blindando as apostas contra sorteios atípicos.
+      5. Decisão Bayesiana sob Restrições Físicas:
+         Filtra as dezenas de maior probabilidade pelas faixas do Teorema Central do Limite (TCL)
+         e pelo equilíbrio estocástico de paridade.
+    """
+
+    def __init__(self,
+                 n_bootstrap: int = 50,
+                 dirichlet_alpha: float = 1.0,
+                 propensity_l2: float = 1.0,
+                 outcome_l2: float = 1.0,
+                 use_structural_filter: bool = True,
+                 tcl_z_bound: float = 1.35,
+                 voting: str = 'hybrid',
+                 random_state: int = 42):
+        if n_bootstrap <= 0:
+            raise ValueError(f"n_bootstrap deve ser > 0. Recebido: {n_bootstrap}")
+        if dirichlet_alpha <= 0.0:
+            raise ValueError(f"dirichlet_alpha deve ser > 0. Recebido: {dirichlet_alpha}")
+        if propensity_l2 < 0.0 or outcome_l2 < 0.0:
+            raise ValueError("L2 regularizers devem ser >= 0.")
+        if tcl_z_bound <= 0.0:
+            raise ValueError("tcl_z_bound deve ser > 0.")
+        if voting not in ('hybrid', 'structural', 'soft', 'hard', 'borda'):
+            raise ValueError(f"voting deve ser 'hybrid', 'structural', 'soft', 'hard' ou 'borda'. Recebido: {voting}")
+
+        self.n_bootstrap = int(n_bootstrap)
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.propensity_l2 = float(propensity_l2)
+        self.outcome_l2 = float(outcome_l2)
+        self.use_structural_filter = bool(use_structural_filter)
+        self.tcl_z_bound = float(tcl_z_bound)
+        self.voting = voting
+        self.random_state = int(random_state)
+
+        # Atributos ajustados
+        self.k_fit_: int = 6
+        self.n_dezenas_: int = 60
+        self.propensity_scores_: Optional[np.ndarray] = None
+        self.outcome_probs_: Optional[np.ndarray] = None
+        self.scores_df_: Optional[pd.DataFrame] = None
+        self.top_k_: Optional[List[int]] = None
+        self.top_ticket_metrics_: Dict[str, Any] = {}
+        self.mean_se_: float = 0.0
+        self.sum_bounds_: Tuple[float, float] = (0.0, 0.0)
+        self.even_bounds_: Tuple[int, int] = (0, 0)
+        self.sum_sigma_: float = 1.0
+
+    def _compute_structural_bounds(self, n_dezenas: int, k: int) -> Tuple[Tuple[float, float], Tuple[int, int], float]:
+        k_eff = min(max(1, int(k)), int(n_dezenas))
+        mu_sum = float(k_eff) * float(n_dezenas + 1) / 2.0
+        var_sum = float(k_eff) * float((n_dezenas + 1) * max(0, n_dezenas - k_eff)) / 12.0
+        sigma_sum = float(np.sqrt(max(var_sum, 1.0)))
+        sum_low = mu_sum - self.tcl_z_bound * sigma_sum
+        sum_high = mu_sum + self.tcl_z_bound * sigma_sum
+
+        n_evens_universe = n_dezenas // 2
+        exp_even = float(k_eff) * (float(n_evens_universe) / float(max(1, n_dezenas)))
+        tol_even = max(1, int(round(0.22 * k_eff)))
+        even_low = max(0, int(np.floor(exp_even)) - tol_even)
+        even_high = min(k_eff, int(np.ceil(exp_even)) + tol_even)
+        return (sum_low, sum_high), (even_low, even_high), sigma_sum
+
+    @staticmethod
+    def _sigmoid(z: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-np.clip(z, -30.0, 30.0)))
+
+    def _extract_structural_covariates(self, binary_matrix: np.ndarray, n_dezenas: int, k: int) -> np.ndarray:
+        """
+        Módulo 1: Extrai covariáveis estruturais invariantes para cada dezena d (Cutting Feedback).
+        X_d = [Atraso relativo / ciclo teórico, z-score Bernoulli acumulado, Posição espacial, Paridade].
+        """
+        n_draws = binary_matrix.shape[0]
+        p_theo = float(k) / float(n_dezenas)
+        cycle_theo = 1.0 / max(p_theo, 1e-4)
+
+        delays = np.zeros(n_dezenas, dtype=float)
+        for d in range(n_dezenas):
+            idx = np.where(binary_matrix[:, d] == 1)[0]
+            delays[d] = float(n_draws - 1 - idx[-1]) if len(idx) > 0 else float(n_draws)
+
+        delay_ratio = delays / cycle_theo
+
+        total_counts = np.sum(binary_matrix, axis=0).astype(float)
+        exp_count = float(n_draws) * p_theo
+        std_count = np.sqrt(max(1e-4, float(n_draws) * p_theo * (1.0 - p_theo)))
+        z_bernoulli = (total_counts - exp_count) / std_count
+
+        positions = (np.arange(1, n_dezenas + 1) - (n_dezenas + 1) / 2.0) / (n_dezenas / 2.0)
+        parities = np.array([1.0 if (d % 2 == 0) else -1.0 for d in range(1, n_dezenas + 1)])
+
+        # Intercept + 4 covariáveis estruturais (Shape: n_dezenas x 5)
+        ones = np.ones(n_dezenas, dtype=float)
+        X_struct = np.column_stack([ones, delay_ratio, z_bernoulli, positions, parities])
+        return X_struct
+
+    def _fit_propensity_scores(self, X_struct: np.ndarray, binary_matrix: np.ndarray, n_dezenas: int, k: int) -> np.ndarray:
+        """
+        Estima o Escore de Propensão b(X_d) = P(Z_d = 1 | X_d) cortando o feedback de ruído alvo.
+        """
+        p_theo = float(k) / float(n_dezenas)
+        total_counts = np.sum(binary_matrix, axis=0).astype(float)
+        n_draws = max(1, binary_matrix.shape[0])
+        prior_weight = 10.0
+        target_p = (total_counts + prior_weight * p_theo) / (float(n_draws) + prior_weight)
+        target_p = np.clip(target_p, 1e-4, 1.0 - 1e-4)
+        target_logit = np.log(target_p / (1.0 - target_p))
+
+        p_dim = X_struct.shape[1]
+        lambda_reg = self.propensity_l2 * np.eye(p_dim)
+        lambda_reg[0, 0] = 0.0
+        gamma = np.linalg.solve(X_struct.T @ X_struct + lambda_reg, X_struct.T @ target_logit)
+
+        fitted_logits = X_struct @ gamma
+        b_x = self._sigmoid(fitted_logits)
+        return b_x
+
+    def _extract_dynamic_features(self, binary_matrix: np.ndarray, n_dezenas: int) -> np.ndarray:
+        """
+        Módulo 2: Sinais dinâmicos de curto e médio prazo Z_d vetorizados.
+        Z_d = [freq_ultimos_5, freq_ultimos_15, transicao_markov].
+        """
+        n_draws = binary_matrix.shape[0]
+        w_short = min(5, n_draws)
+        w_med = min(15, n_draws)
+
+        f_short = np.mean(binary_matrix[-w_short:], axis=0) if w_short > 0 else np.zeros(n_dezenas)
+        f_med = np.mean(binary_matrix[-w_med:], axis=0) if w_med > 0 else np.zeros(n_dezenas)
+
+        markov_signal = np.zeros(n_dezenas, dtype=float)
+        if n_draws >= 2:
+            last_draw = binary_matrix[-1]
+            last_drawn_idx = np.where(last_draw == 1)[0]
+            if len(last_drawn_idx) > 0:
+                row_overlaps = np.sum(binary_matrix[:-1, last_drawn_idx], axis=1) / max(1.0, float(len(last_drawn_idx)))
+                trans_counts = row_overlaps @ binary_matrix[1:]
+                denom = np.sum(trans_counts)
+                if denom > 0:
+                    markov_signal = trans_counts / denom
+
+        return np.column_stack([f_short, f_med, markov_signal])
+
+    def fit(self, binary_matrix: np.ndarray, cfg: Optional[Dict] = None):
+        if not isinstance(binary_matrix, np.ndarray) or binary_matrix.ndim != 2:
+            raise ValueError("binary_matrix deve ser um numpy ndarray 2D.")
+        if binary_matrix.shape[0] == 0:
+            raise ValueError("binary_matrix não pode estar vazia.")
+
+        n_draws, n_dezenas = binary_matrix.shape
+        self.n_dezenas_ = n_dezenas
+        k = cfg.get('k', 6) if cfg else 6
+        self.k_fit_ = min(max(1, int(k)), n_dezenas)
+
+        rng = np.random.RandomState(self.random_state)
+        self.sum_bounds_, self.even_bounds_, self.sum_sigma_ = self._compute_structural_bounds(n_dezenas, self.k_fit_)
+
+        # Estágio 1: Escore de Propensão Estrutural b(X) com Cutting Feedback
+        X_struct = self._extract_structural_covariates(binary_matrix, n_dezenas, self.k_fit_)
+        b_x = self._fit_propensity_scores(X_struct, binary_matrix, n_dezenas, self.k_fit_)
+        self.propensity_scores_ = b_x
+
+        # Estágio 2: Sinais Dinâmicos de Curto Prazo Z_d
+        Z_dyn = self._extract_dynamic_features(binary_matrix, n_dezenas)
+
+        # Matriz Duplamente Robusta [1, Z, b(X), Z * b(X)]
+        ones = np.ones((n_dezenas, 1), dtype=float)
+        b_col = b_x.reshape(-1, 1)
+        Z_interaction = Z_dyn * b_col
+        Design_Matrix = np.hstack([ones, Z_dyn, b_col, Z_interaction])
+        n_features = Design_Matrix.shape[1]
+
+        # Estágio 3: Bootstrap Bayesiano via Processo de Dirichlet
+        p_theo = float(self.k_fit_) / float(n_dezenas)
+        n_history_samples = min(n_draws, 100)
+        sub_matrix = binary_matrix[-n_history_samples:]
+
+        all_probs = np.zeros((self.n_bootstrap, n_dezenas), dtype=float)
+        all_hard_votes = np.zeros(n_dezenas, dtype=float)
+        all_borda = np.zeros((self.n_bootstrap, n_dezenas), dtype=float)
+
+        lambda_out = self.outcome_l2 * np.eye(n_features)
+        lambda_out[0, 0] = 0.0
+
+        for b in range(self.n_bootstrap):
+            dir_weights = rng.exponential(scale=1.0, size=n_history_samples)
+            dir_weights = dir_weights / max(1e-9, np.sum(dir_weights))
+
+            target_draw_p = np.sum(sub_matrix * dir_weights[:, None], axis=0)
+            target_draw_p = 0.85 * target_draw_p + 0.15 * p_theo
+            target_draw_p = np.clip(target_draw_p, 1e-4, 1.0 - 1e-4)
+            y_logit = np.log(target_draw_p / (1.0 - target_draw_p))
+
+            theta_b = np.linalg.solve(Design_Matrix.T @ Design_Matrix + lambda_out, Design_Matrix.T @ y_logit)
+
+            pred_logit_b = Design_Matrix @ theta_b
+            prob_b = self._sigmoid(pred_logit_b)
+            sum_p = np.sum(prob_b)
+            if sum_p > 0:
+                prob_b_norm = prob_b * (float(self.k_fit_) / sum_p)
+            else:
+                prob_b_norm = np.full(n_dezenas, p_theo)
+
+            all_probs[b] = prob_b_norm
+
+            ranks = np.argsort(prob_b_norm)[::-1]
+            for r_idx, d_idx in enumerate(ranks):
+                all_borda[b, d_idx] = 1.0 - (float(r_idx) / max(1.0, float(n_dezenas - 1)))
+
+            top_b = np.argsort(prob_b_norm)[::-1][:self.k_fit_]
+            for d_idx in top_b:
+                all_hard_votes[d_idx] += 1.0
+
+        prob_mean = np.mean(all_probs, axis=0)
+        borda_mean = np.mean(all_borda, axis=0)
+        hard_rate = all_hard_votes / float(self.n_bootstrap)
+
+        prob_std = np.std(all_probs, axis=0)
+        se_vec = prob_std / np.sqrt(float(self.n_bootstrap))
+        self.mean_se_ = float(np.mean(se_vec))
+
+        b_x_norm = _min_max_scale(b_x)
+        prob_norm = _min_max_scale(prob_mean)
+        borda_norm = _min_max_scale(borda_mean)
+
+        escore_causal_raw = (
+            0.30 * b_x_norm
+            + 0.40 * prob_norm
+            + 0.15 * borda_norm
+            + 0.15 * hard_rate
+        )
+        escore_causal_norm = _min_max_scale(escore_causal_raw)
+
+        dezenas = np.arange(1, n_dezenas + 1)
+        self.scores_df_ = pd.DataFrame({
+            'dezena': dezenas,
+            'escore_causal_propensao': np.round(escore_causal_norm, 5),
+            'escore_propensao_basal': np.round(b_x, 5),
+            'probabilidade_posterior': np.round(prob_mean, 5),
+            'escore_borda': np.round(borda_mean, 5),
+            'votos_bootstrap': all_hard_votes.astype(int),
+            'taxa_selecao_pct': np.round(hard_rate * 100.0, 2),
+            'incerteza_se': np.round(se_vec, 6),
+        }).sort_values(['escore_causal_propensao', 'votos_bootstrap', 'dezena'], ascending=[False, False, True]).reset_index(drop=True)
+
+        self.top_k_ = self.predict_top_k(self.k_fit_, voting=self.voting)
+        s_top = sum(self.top_k_)
+        e_top = sum(1 for x in self.top_k_ if x % 2 == 0)
+        self.top_ticket_metrics_ = {
+            'top_k': self.top_k_,
+            'sum': s_top,
+            'sum_bounds': tuple(round(v, 2) for v in self.sum_bounds_),
+            'evens': e_top,
+            'even_bounds': self.even_bounds_,
+            'passes_tcl_sum': bool(self.sum_bounds_[0] <= s_top <= self.sum_bounds_[1]),
+            'passes_parity': bool(self.even_bounds_[0] <= e_top <= self.even_bounds_[1]),
+            'mean_se': round(self.mean_se_, 6),
+        }
+        return self
+
+    def _filter_ticket_structural(self, ranked_dezenas: List[int], k: int) -> List[int]:
+        sum_low, sum_high = self.sum_bounds_
+        even_low, even_high = self.even_bounds_
+
+        greedy_k = ranked_dezenas[:k]
+        s_cand = sum(greedy_k)
+        e_cand = sum(1 for d in greedy_k if d % 2 == 0)
+
+        if (sum_low <= s_cand <= sum_high) and (even_low <= e_cand <= even_high):
+            return sorted(greedy_k)
+
+        pool = ranked_dezenas[:min(len(ranked_dezenas), k + 15)]
+        best_ticket = greedy_k
+        best_dist = 1e9
+
+        from itertools import combinations
+        base_set = set(greedy_k)
+        pool_extra = [d for d in pool if d not in base_set]
+
+        # 1-swap rápido
+        for out_d in greedy_k:
+            for in_d in pool_extra:
+                cand = (base_set - {out_d}) | {in_d}
+                cand_list = sorted(list(cand))
+                s = sum(cand_list)
+                e = sum(1 for d in cand_list if d % 2 == 0)
+                viol_sum = max(0.0, sum_low - s) + max(0.0, s - sum_high)
+                viol_even = max(0, even_low - e) + max(0, e - even_high)
+                dist = viol_sum + 20.0 * viol_even
+                if dist < best_dist:
+                    best_dist = dist
+                    best_ticket = cand_list
+                    if dist == 0.0:
+                        return best_ticket
+
+        # 2-swaps se ainda necessário
+        if best_dist > 0.0 and len(pool_extra) >= 2:
+            for out_items in combinations(greedy_k, 2):
+                for in_items in combinations(pool_extra, 2):
+                    cand = (base_set - set(out_items)) | set(in_items)
+                    cand_list = sorted(list(cand))
+                    s = sum(cand_list)
+                    e = sum(1 for d in cand_list if d % 2 == 0)
+                    viol_sum = max(0.0, sum_low - s) + max(0.0, s - sum_high)
+                    viol_even = max(0, even_low - e) + max(0, e - even_high)
+                    dist = viol_sum + 20.0 * viol_even
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_ticket = cand_list
+                        if dist == 0.0:
+                            return best_ticket
+
+        return sorted(best_ticket)
+
+    def predict_top_k(self, k: Optional[int] = None, voting: Optional[str] = None) -> List[int]:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        if k is None:
+            k = self.k_fit_
+        if k <= 0:
+            return []
+        n_dezenas = len(self.scores_df_)
+        k = min(int(k), n_dezenas)
+
+        use_voting = voting or self.voting
+        if use_voting in ('hybrid', 'structural'):
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_causal_propensao', 'votos_bootstrap', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'hard':
+            df_sorted = self.scores_df_.sort_values(
+                ['votos_bootstrap', 'escore_causal_propensao', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'soft':
+            df_sorted = self.scores_df_.sort_values(
+                ['probabilidade_posterior', 'escore_propensao_basal', 'dezena'], ascending=[False, False, True]
+            )
+        elif use_voting == 'borda':
+            df_sorted = self.scores_df_.sort_values(
+                ['escore_borda', 'escore_causal_propensao', 'dezena'], ascending=[False, False, True]
+            )
+        else:
+            raise ValueError(f"Modo de votação inválido: {use_voting}")
+
+        ranked = [int(x) for x in df_sorted['dezena'].tolist()]
+        if self.use_structural_filter or (use_voting == 'structural'):
+            return self._filter_ticket_structural(ranked, k)
+        return sorted(ranked[:k])
+
+    def get_scores_df(self) -> pd.DataFrame:
+        if self.scores_df_ is None:
+            raise RuntimeError("O modelo precisa ser ajustado com fit() primeiro.")
+        return self.scores_df_.copy()
+
+
+LotteryNobreStephensCausalModel = LotteryCausalPropensityModel
+NobreStephensCausalPropensityModel = LotteryCausalPropensityModel
+
+
 class LotteryResidualCyclingGradientBoostingModel:
 
     """
@@ -10678,6 +11065,31 @@ def predict_elite_committee(binary_matrix: np.ndarray,
     return model.predict_top_k(k_actual)
 
 
+def predict_causal_propensity(binary_matrix: np.ndarray,
+                             cfg: Dict,
+                             k: Optional[int] = None,
+                             n_bootstrap: int = 50,
+                             dirichlet_alpha: float = 1.0,
+                             propensity_l2: float = 1.0,
+                             outcome_l2: float = 1.0,
+                             use_structural_filter: bool = True,
+                             voting: str = 'hybrid',
+                             random_state: int = 42) -> List[int]:
+    """Predição direta das top K dezenas via Modelo Bayesiano Causal Duplamente Robusto (Método 39 - Nobre-Stephens)."""
+    k_actual = cfg['k'] if k is None else k
+    model = LotteryCausalPropensityModel(
+        n_bootstrap=n_bootstrap,
+        dirichlet_alpha=dirichlet_alpha,
+        propensity_l2=propensity_l2,
+        outcome_l2=outcome_l2,
+        use_structural_filter=use_structural_filter,
+        voting=voting,
+        random_state=random_state,
+    )
+    model.fit(binary_matrix, cfg=cfg)
+    return model.predict_top_k(k_actual)
+
+
 
 def compare_committee_sizes(binary_matrix: np.ndarray,
                             cfg: Dict,
@@ -11210,6 +11622,11 @@ def run_all_lottery_methods(filepath: str,
     )
     pred_elite_committee_100 = m_elite_committee_100.predict_top_k(k)
 
+    # 39. Método 39: Modelo Bayesiano Causal Duplamente Robusto com Bootstrap de Dirichlet (Nobre-Stephens)
+    m_causal_propensity = LotteryCausalPropensityModel(n_bootstrap=50, random_state=42)
+    m_causal_propensity.fit(binary_matrix, cfg=cfg)
+    pred_causal_propensity = m_causal_propensity.predict_top_k(k)
+
 
 
     predictions_ensemble = {
@@ -11248,7 +11665,8 @@ def run_all_lottery_methods(filepath: str,
 
         'Ensemble Comitê Profundo Multi-Família (M=100)': pred_deep_committee_100,
         'Ensemble Comitê de Gianella (M=100)': pred_gianella_committee_100,
-        'Ensemble Super-Comitê de Elite (M=100)': pred_elite_committee_100
+        'Ensemble Super-Comitê de Elite (M=100)': pred_elite_committee_100,
+        'Ensemble Causal Propensão (Nobre-Stephens)': pred_causal_propensity
 
     }
 
@@ -11346,6 +11764,7 @@ def run_all_lottery_methods(filepath: str,
         predictions['Metodo 36 (Ensemble Comitê Profundo Multi-Família - M=100)'] = pred_deep_committee_100
         predictions['Metodo 37 (Ensemble Comite de Gianella - M=100)'] = pred_gianella_committee_100
         predictions['Metodo 38 (Ensemble Super-Comite de Elite - M=100)'] = pred_elite_committee_100
+        predictions['Metodo 39 (Ensemble Causal Propensao - Nobre-Stephens)'] = pred_causal_propensity
 
 
 
@@ -11424,6 +11843,7 @@ def run_all_lottery_methods(filepath: str,
         'm_deep_committee_100': m_deep_committee_100,
         'm_gianella_committee_100': m_gianella_committee_100,
         'm_elite_committee_100': m_elite_committee_100,
+        'm_causal_propensity': m_causal_propensity,
 
         'pred_consenso': pred_consenso,
 

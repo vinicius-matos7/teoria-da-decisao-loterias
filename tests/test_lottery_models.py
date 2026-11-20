@@ -84,6 +84,9 @@ from mega_sena_models import (
     LotteryEliteCommitteeModel,
     LotterySuperEliteCommitteeModel,
     LotteryEliteMetaCommitteeModel,
+    LotteryCausalPropensityModel,
+    LotteryNobreStephensCausalModel,
+    NobreStephensCausalPropensityModel,
 
     predict_bagged_logit_gb_ensemble,
 
@@ -94,6 +97,7 @@ from mega_sena_models import (
     predict_deep_ensemble_committee,
     predict_gianella_committee,
     predict_elite_committee,
+    predict_causal_propensity,
 
     compare_committee_sizes,
 
@@ -2028,6 +2032,73 @@ class TestModelsExecution:
         with pytest.raises(ValueError):
             LotteryEliteCommitteeModel(voting='invalido')
 
+    def test_lottery_causal_propensity_model(self, synthetic_data):
+        cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
+        assert LotteryNobreStephensCausalModel is LotteryCausalPropensityModel
+        assert NobreStephensCausalPropensityModel is LotteryCausalPropensityModel
+
+        m_default = LotteryCausalPropensityModel(random_state=42)
+        assert m_default.n_bootstrap == 50
+        assert m_default.dirichlet_alpha == 1.0
+        assert m_default.voting == 'hybrid'
+
+        m_fit = m_default.fit(synthetic_data, cfg=cfg)
+        assert m_fit is m_default
+        pred_top6 = m_default.predict_top_k(6)
+        assert len(pred_top6) == 6
+        assert len(set(pred_top6)) == 6
+        assert all(1 <= d <= 60 for d in pred_top6)
+
+        metrics = m_default.top_ticket_metrics_
+        assert metrics['passes_tcl_sum'] is True
+        assert metrics['passes_parity'] is True
+        assert metrics['mean_se'] > 0.0
+
+        df_scores = m_default.get_scores_df()
+        assert len(df_scores) == 60
+        for col in ['dezena', 'escore_causal_propensao', 'escore_propensao_basal',
+                    'probabilidade_posterior', 'escore_borda', 'votos_bootstrap', 'taxa_selecao_pct', 'incerteza_se']:
+            assert col in df_scores.columns
+
+        for v_mode in ('hybrid', 'structural', 'soft', 'hard', 'borda'):
+            mv = LotteryCausalPropensityModel(n_bootstrap=15, voting=v_mode, random_state=42).fit(synthetic_data, cfg=cfg)
+            pred_v = mv.predict_top_k(6)
+            assert len(pred_v) == 6
+            assert len(set(pred_v)) == 6
+
+        # Validação Lotofácil
+        cfg_lf = {'k': 15, 'n_dezenas': 25, 'alpha_0': 6.0, 'beta_0': 1.0, 'gianella_group_size': 5}
+        mat_lf = np.random.choice([0, 1], size=(40, 25), p=[0.4, 0.6])
+        lf_m = LotteryCausalPropensityModel(n_bootstrap=20, random_state=7).fit(mat_lf, cfg=cfg_lf)
+        pred_lf = lf_m.predict_top_k(15)
+        assert len(pred_lf) == 15
+        assert lf_m.top_ticket_metrics_['passes_tcl_sum'] is True
+        assert lf_m.top_ticket_metrics_['passes_parity'] is True
+
+        # Validação Quina
+        cfg_qn = {'k': 5, 'n_dezenas': 80, 'alpha_0': 1.0, 'beta_0': 15.0, 'gianella_group_size': 10}
+        mat_qn = np.random.choice([0, 1], size=(40, 80), p=[0.9375, 0.0625])
+        qn_m = LotteryCausalPropensityModel(n_bootstrap=20, random_state=7).fit(mat_qn, cfg=cfg_qn)
+        pred_qn = qn_m.predict_top_k(5)
+        assert len(pred_qn) == 5
+        assert qn_m.top_ticket_metrics_['passes_tcl_sum'] is True
+        assert qn_m.top_ticket_metrics_['passes_parity'] is True
+
+        # Casos de borda
+        assert len(LotteryCausalPropensityModel(n_bootstrap=10, random_state=42).fit(synthetic_data[:1], cfg=cfg).predict_top_k(6)) == 6
+        assert len(LotteryCausalPropensityModel(n_bootstrap=10, random_state=42).fit(synthetic_data[:5], cfg=cfg).predict_top_k(6)) == 6
+        assert len(LotteryCausalPropensityModel(n_bootstrap=10, random_state=42).fit(np.zeros((20, 60), dtype=int), cfg=cfg).predict_top_k(6)) == 6
+
+        with pytest.raises(RuntimeError):
+            LotteryCausalPropensityModel().predict_top_k(6)
+        with pytest.raises(ValueError):
+            LotteryCausalPropensityModel().fit(np.zeros((0, 60)), cfg=cfg)
+        with pytest.raises(ValueError):
+            LotteryCausalPropensityModel(n_bootstrap=0)
+        with pytest.raises(ValueError):
+            LotteryCausalPropensityModel(voting='invalido')
+
+
     def test_compare_committee_sizes(self, synthetic_data):
 
         cfg = {'k': 6, 'n_dezenas': 60, 'alpha_0': 1.0, 'beta_0': 9.0, 'gianella_group_size': 10}
@@ -2136,6 +2207,7 @@ class TestModelsExecution:
 
         p_elite_100 = predict_elite_committee(synthetic_data, cfg, k=6, trained_ensembles=pre_dict)
         assert p_elite_100 == predict_elite_committee(synthetic_data, cfg, k=6, n_committees=100, trained_ensembles=pre_dict)
+        p_causal_prop = predict_causal_propensity(synthetic_data, cfg, k=6, n_bootstrap=10)
 
         assert p_meta_default == p_meta_100
 
@@ -2163,7 +2235,8 @@ class TestModelsExecution:
 
                           ('deep_committee_50', p_deep_50), ('deep_committee_100', p_deep_100),
                           ('gianella_committee_100', p_gianella_100),
-                          ('elite_committee_100', p_elite_100)]:
+                          ('elite_committee_100', p_elite_100),
+                          ('causal_propensity', p_causal_prop)]:
 
             assert len(bet) == 6, f"Tamanho incorreto para {name}"
 
@@ -2257,7 +2330,7 @@ class TestRunAllLotteryMethods:
 
                          'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd', 'm_bagged_logit_gb', 'm_dual_logit_gb',
 
-                         'm_meta_committee_100', 'm_deep_committee_100', 'm_gianella_committee_100', 'm_elite_committee_100',
+                         'm_meta_committee_100', 'm_deep_committee_100', 'm_gianella_committee_100', 'm_elite_committee_100', 'm_causal_propensity',
 
                          'predictions', 'predictions_ensemble', 'comparison_df']
 
@@ -2331,7 +2404,7 @@ class TestRunAllLotteryMethods:
 
                          'm_batch_gd', 'm_minibatch_gd', 'm_stoch_gd', 'm_bagged_logit_gb', 'm_dual_logit_gb',
 
-                         'm_meta_committee_100', 'm_deep_committee_100', 'm_gianella_committee_100', 'm_elite_committee_100',
+                         'm_meta_committee_100', 'm_deep_committee_100', 'm_gianella_committee_100', 'm_elite_committee_100', 'm_causal_propensity',
 
                          'pred_consenso', 'consensus_scores', 'predictions', 'predictions_hybrid',
 
@@ -2343,13 +2416,13 @@ class TestRunAllLotteryMethods:
 
 
 
-        assert len(results['predictions']) == 42
+        assert len(results['predictions']) == 43
 
-        assert len(results['comparison_df']) == 42
+        assert len(results['comparison_df']) == 43
 
         assert len(results['predictions_hybrid']) == 15
 
-        assert len(results['predictions_ensemble']) == 19
+        assert len(results['predictions_ensemble']) == 20
 
 
 
