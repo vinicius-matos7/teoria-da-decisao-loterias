@@ -8374,6 +8374,7 @@ class LotteryCausalPropensityModel:
 
 LotteryNobreStephensCausalModel = LotteryCausalPropensityModel
 NobreStephensCausalPropensityModel = LotteryCausalPropensityModel
+LotteryCausalCommitteeModel = LotteryCausalPropensityModel
 
 
 class LotteryResidualCyclingGradientBoostingModel:

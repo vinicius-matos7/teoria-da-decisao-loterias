@@ -14,8 +14,8 @@ __pycache__/
 *.mkv
 *.zip
 *.tar.gz
-bibliografia/*.mp4
-bibliografia/Hands-On_Machine_Learning*.pdf
+# Bibliografia e artigos de pesquisa (mantidos localmente)
+bibliografia/
 
 # Ambientes virtuais e IDEs
 .env

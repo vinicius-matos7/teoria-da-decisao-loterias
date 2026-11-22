@@ -2348,7 +2348,7 @@ class TestRunAllLotteryMethods:
 
         assert len(results['comparison_df']) == 7
 
-        assert len(results['predictions_ensemble']) == 19
+        assert len(results['predictions_ensemble']) == 20
 
         
 
