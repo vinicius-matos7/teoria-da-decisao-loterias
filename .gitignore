@@ -7,16 +7,15 @@ __pycache__/
 .ipynb_checkpoints/
 */.ipynb_checkpoints/*
 
-# Material didático e bibliografia (ignorado do repositório)
-bibliografia/
-
-# Vídeos e arquivos pesados (> 100 MB excede o limite do GitHub)
+# Arquivos pesados (> 50 MB excede ou aproxima do limite do GitHub) e vídeos
 *.mp4
 *.avi
 *.mov
 *.mkv
 *.zip
 *.tar.gz
+bibliografia/*.mp4
+bibliografia/Hands-On_Machine_Learning*.pdf
 
 # Ambientes virtuais e IDEs
 .env
